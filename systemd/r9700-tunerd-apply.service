@@ -1,10 +1,14 @@
 [Unit]
-Description=R9700 tuner oneshot apply (add/bind)
+Description=R9700 tuner oneshot apply (pulled in by udev on PCI add/bind)
 Documentation=file:///usr/local/share/doc/r9700-tunerd/README.md
-After=systemd-udev-settle.service
 
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/r9700-tunerd apply
 Nice=10
+RuntimeDirectory=r9700-tunerd
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/sys/bus/pci/devices
 PrivateTmp=yes

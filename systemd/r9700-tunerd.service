@@ -1,8 +1,13 @@
 [Unit]
 Description=R9700 runtime-PM-aware tuner (runtime_status watcher)
 Documentation=file:///usr/local/share/doc/r9700-tunerd/README.md
-After=systemd-udev-settle.service
+# The watcher discovers the card itself and waits if it is not there yet, so no
+# device ordering is required (systemd-udev-settle is deprecated and a no-op).
 ConditionPathExists=/sys/bus/pci
+# A bad config is refused at startup with a clear error; do not let a persistent
+# failure turn into a tight restart loop.
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -10,8 +15,16 @@ ExecStart=/usr/local/sbin/r9700-tunerd watch
 Restart=on-failure
 RestartSec=5
 Nice=10
-# Never touch DRM/render nodes; sysfs only.
+# Sysfs-only daemon: never opens DRM/render nodes. Hardening below keeps root's
+# write surface to /sys (OD, hwmon) and its own runtime directory.
+RuntimeDirectory=r9700-tunerd
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/sys/bus/pci/devices
 PrivateTmp=yes
+# Do NOT add ProtectKernelTunables: it mounts /sys read-only and would silently
+# break every OD/power-cap write.
 
 [Install]
 WantedBy=multi-user.target

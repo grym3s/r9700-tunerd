@@ -2,7 +2,7 @@
 
 Runtime-PM-aware tuner for the ASUS Radeon AI PRO R9700 32GB on Omarchy.
 
-Phase A/B: stable DRM names + power cap + 0 mV VDDGFX offset.
+Phase A/B/C: stable DRM names + power cap + VDDGFX offset restored after every D3cold wake by the runtime_status watcher. See docs/ARCHITECTURE.md.
 No DRM/render-node handles. No LACT on the control path. No fan curve yet.
 
 ## Paths
@@ -21,7 +21,6 @@ No DRM/render-node handles. No LACT on the control path. No fan curve yet.
     r9700-tunerd reset
     r9700-tunerd set-undervolt -50
     r9700-tunerd probe-poll
-    r9700-tunerd test-ab
 
 ## Rollback
 
