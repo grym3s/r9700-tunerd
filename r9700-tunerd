@@ -6,6 +6,8 @@ Checks power/runtime_status before every sensor/OD/cap access.
 
 Watcher (Class C): on suspended -> active, restore VOLTAGE_OFFSET_MV only.
 Power cap is not rewritten on ordinary BACO resume.
+Also detects resume via power/runtime_suspended_time (monotonic counter)
+when the suspended state was never sampled between polls.
 """
 from __future__ import annotations
 
@@ -334,6 +336,22 @@ def runtime_status(pci: Path) -> str:
         return read_text(pci / "power" / "runtime_status").lower()
     except OSError as e:
         return f"unreadable:{e}"
+
+
+def runtime_suspended_ms(pci: Path) -> int | None:
+    """Read power/runtime_suspended_time (accumulated ms in suspend state).
+
+    Safe to read while the device is suspended: the kernel does not wake
+    the card to service this sysfs read (verified on target: 20 reads at
+    0.5 s intervals, status remained suspended/D3cold).  The value is
+    monotonically increasing and increments on every suspend, making it a
+    reliable wake signal even when the suspended state is never observed
+    by the poll loop (e.g. suspend+resume both occur between two polls).
+    """
+    try:
+        return int(read_text(pci / "power" / "runtime_suspended_time"))
+    except (OSError, ValueError):
+        return None
 
 
 def power_state(pci: Path) -> str:
@@ -815,12 +833,14 @@ def cmd_watch(conf: dict) -> int:
     last_warn_text: str | None = None
     last_unknown_warn: str | None = None
     was_present = pci is not None
+    susp_at_last_wake: int | None = None
 
     # Initial edge: if already active, treat as unconfigured (boot / daemon start).
     if pci is not None and is_active(pci):
         state = ST_ACTIVE_UNCONFIGURED
         cap_checked = handle_wake(pci, last_good, cap_checked)
         state = ST_ACTIVE_CONFIGURED
+        susp_at_last_wake = runtime_suspended_ms(pci)
     elif pci is not None:
         state = ST_SUSPENDED
 
@@ -863,6 +883,7 @@ def cmd_watch(conf: dict) -> int:
                     log("R9700 not present", syslog.LOG_WARNING)
                     was_present = False
                 state = ST_SUSPENDED
+                susp_at_last_wake = None
                 time.sleep(interval)
                 continue
 
@@ -874,10 +895,30 @@ def cmd_watch(conf: dict) -> int:
             # Only "active" is a rising edge; only "suspended" is a falling edge.
             # "unreadable:...", "suspending", "resuming" are NOT transitions.
             if st == "active":
+                now_susp = runtime_suspended_ms(pci)
+                wake_detected = False
+                via_counter = False
+
                 if state == ST_SUSPENDED:
+                    wake_detected = True
+                elif (
+                    now_susp is not None
+                    and susp_at_last_wake is not None
+                    and now_susp > susp_at_last_wake
+                ):
+                    wake_detected = True
+                    via_counter = True
+
+                if wake_detected:
+                    if via_counter:
+                        log(
+                            "R9700 runtime active (resume detected via "
+                            "runtime_suspended_time, suspended sample not observed)"
+                        )
                     state = ST_ACTIVE_UNCONFIGURED
                     cap_checked = handle_wake(pci, conf_now, cap_checked)
                     state = ST_ACTIVE_CONFIGURED
+                    susp_at_last_wake = runtime_suspended_ms(pci)
             elif st == "suspended":
                 if state != ST_SUSPENDED:
                     log("R9700 runtime suspended")

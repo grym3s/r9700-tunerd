@@ -50,6 +50,7 @@ def fake_tree(tmp_path, monkeypatch):
     power.mkdir()
     (power / "runtime_status").write_text("active\n")
     (power / "control").write_text("auto\n")
+    (power / "runtime_suspended_time").write_text("1000\n")
     (gpu / "power_state").write_text("D0\n")
 
     od_text = (
@@ -121,3 +122,17 @@ def conf():
     parsed, problems = rt.validate_conf(raw)
     assert not problems, f"Unexpected validation problems: {problems}"
     return parsed
+
+
+# ---------------------------------------------------------------------------
+# Test helpers
+# ---------------------------------------------------------------------------
+
+
+def bump_suspended(pci: Path, ms: int) -> None:
+    """Set power/runtime_suspended_time to the given value (ms).
+
+    Simulates the kernel incrementing the monotonic suspend-time counter
+    after a suspend/resume cycle.
+    """
+    (pci / "power" / "runtime_suspended_time").write_text(f"{ms}\n")

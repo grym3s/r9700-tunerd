@@ -4,6 +4,7 @@ from __future__ import annotations
 import errno
 import os
 import syslog
+from pathlib import Path
 
 import pytest
 
@@ -543,3 +544,179 @@ def test_watch_loop_keeps_last_good_config(
         msg for level, msg in log_recorder if "config reload failed" in msg
     ]
     assert len(reload_warnings) == 1
+
+
+# ===================================================================
+# cmd_watch — counter-based resume detection (Patch 3)
+# ===================================================================
+
+
+def test_watch_detects_resume_without_suspended_sample(
+    fake_tree, conf, log_recorder, monkeypatch, tmp_path
+):
+    """Status stays 'active' the whole time; counter bump triggers a 2nd wake."""
+    pci = fake_tree / "0000:aa:00.0"
+
+    conf_file = tmp_path / "watch.conf"
+    conf_file.write_text(
+        "VENDOR=0x1002\n"
+        "DEVICE=0x7551\n"
+        "SUBSYSTEM_VENDOR=0x1043\n"
+        "SUBSYSTEM_DEVICE=0x0626\n"
+        "POWER_LIMIT_W=210\n"
+        "VOLTAGE_OFFSET_MV=0\n"
+        "POLL_INTERVAL_S=2\n"
+    )
+    monkeypatch.setattr(rt, "CONF_PATH", conf_file)
+
+    rt._stop = False
+    rt._last_pm_refusal = None
+    rt._last_kernel_scan = 0.0
+
+    # Monkeypatch handle_wake to count invocations.
+    wake_count = 0
+
+    def fake_handle_wake(p, c, cc):
+        nonlocal wake_count
+        wake_count += 1
+        return True
+
+    monkeypatch.setattr(rt, "handle_wake", fake_handle_wake)
+
+    # Drive the loop:
+    #   Initial startup: handle_wake (count=1), susp_at_last_wake=1000
+    #   Iter 1: active, counter=1000, no change → no wake
+    #   sleep 1: bump counter to 2000
+    #   Iter 2: active, counter=2000 > 1000 → counter-detected wake (count=2)
+    #   sleep 2: stop
+    sleep_count = 0
+
+    def fake_sleep(*args, **kwargs):
+        nonlocal sleep_count
+        sleep_count += 1
+        if sleep_count == 1:
+            # Simulate a suspend+resume that the poll never witnessed.
+            (pci / "power" / "runtime_suspended_time").write_text("2000\n")
+        elif sleep_count == 2:
+            rt._stop = True
+
+    monkeypatch.setattr(rt.time, "sleep", fake_sleep)
+
+    result = rt.cmd_watch(conf)
+    assert result == 0
+    assert wake_count == 2  # initial + counter-detected
+
+    # The distinct log line must be present.
+    all_msgs = [msg for _, msg in log_recorder]
+    assert any(
+        "resume detected via runtime_suspended_time" in m for m in all_msgs
+    )
+
+
+def test_watch_no_reapply_when_counter_unchanged(
+    fake_tree, conf, log_recorder, monkeypatch, tmp_path
+):
+    """Status active for several polls, counter constant → exactly one wake."""
+    pci = fake_tree / "0000:aa:00.0"
+
+    conf_file = tmp_path / "watch.conf"
+    conf_file.write_text(
+        "VENDOR=0x1002\n"
+        "DEVICE=0x7551\n"
+        "SUBSYSTEM_VENDOR=0x1043\n"
+        "SUBSYSTEM_DEVICE=0x0626\n"
+        "POWER_LIMIT_W=210\n"
+        "VOLTAGE_OFFSET_MV=0\n"
+        "POLL_INTERVAL_S=2\n"
+    )
+    monkeypatch.setattr(rt, "CONF_PATH", conf_file)
+
+    rt._stop = False
+    rt._last_pm_refusal = None
+    rt._last_kernel_scan = 0.0
+
+    wake_count = 0
+
+    def fake_handle_wake(p, c, cc):
+        nonlocal wake_count
+        wake_count += 1
+        return True
+
+    monkeypatch.setattr(rt, "handle_wake", fake_handle_wake)
+
+    # 3 loop iterations; counter stays at 1000 the whole time.
+    sleep_count = 0
+
+    def fake_sleep(*args, **kwargs):
+        nonlocal sleep_count
+        sleep_count += 1
+        if sleep_count == 3:
+            rt._stop = True
+
+    monkeypatch.setattr(rt.time, "sleep", fake_sleep)
+
+    result = rt.cmd_watch(conf)
+    assert result == 0
+    assert wake_count == 1  # only the initial startup wake
+
+
+def test_watch_counter_unreadable_falls_back_to_edges(
+    fake_tree, conf, log_recorder, monkeypatch, tmp_path
+):
+    """Counter file removed; active→suspended→active still triggers two wakes."""
+    pci = fake_tree / "0000:aa:00.0"
+
+    # Remove the counter file so runtime_suspended_ms returns None.
+    susp_file = pci / "power" / "runtime_suspended_time"
+    susp_file.unlink()
+
+    conf_file = tmp_path / "watch.conf"
+    conf_file.write_text(
+        "VENDOR=0x1002\n"
+        "DEVICE=0x7551\n"
+        "SUBSYSTEM_VENDOR=0x1043\n"
+        "SUBSYSTEM_DEVICE=0x0626\n"
+        "POWER_LIMIT_W=210\n"
+        "VOLTAGE_OFFSET_MV=0\n"
+        "POLL_INTERVAL_S=2\n"
+    )
+    monkeypatch.setattr(rt, "CONF_PATH", conf_file)
+
+    rt._stop = False
+    rt._last_pm_refusal = None
+    rt._last_kernel_scan = 0.0
+
+    wake_count = 0
+
+    def fake_handle_wake(p, c, cc):
+        nonlocal wake_count
+        wake_count += 1
+        return True
+
+    monkeypatch.setattr(rt, "handle_wake", fake_handle_wake)
+
+    # Sequence:
+    #   Initial: active → wake 1 (startup)
+    #   Iter 1: active, state=ACTIVE_CONFIGURED → no wake
+    #   sleep 1: set status to suspended
+    #   Iter 2: suspended → state=SUSPENDED
+    #   sleep 2: set status to active
+    #   Iter 3: active + state=SUSPENDED → wake 2 (edge)
+    #   sleep 3: stop
+    sleep_count = 0
+
+    def fake_sleep(*args, **kwargs):
+        nonlocal sleep_count
+        sleep_count += 1
+        if sleep_count == 1:
+            (pci / "power" / "runtime_status").write_text("suspended\n")
+        elif sleep_count == 2:
+            (pci / "power" / "runtime_status").write_text("active\n")
+        elif sleep_count == 3:
+            rt._stop = True
+
+    monkeypatch.setattr(rt.time, "sleep", fake_sleep)
+
+    result = rt.cmd_watch(conf)
+    assert result == 0
+    assert wake_count == 2  # initial + edge-detected
