@@ -15,6 +15,19 @@ Arch/Omarchy). Re-measure before relying on them on another kernel or firmware.
 The Strix Halo iGPU is `0x1002:0x1586`, subsystem `0x1f66:0x0030`, and is the
 display GPU (Hyprland pinned via `/dev/dri/amd-igpu`).
 
+**Attributes that do NOT distinguish the two the way one might expect** (measured):
+
+| attribute | R9700 | Strix iGPU |
+|---|---|---|
+| `class` | `0x030000` (VGA) | `0x038000` (display, non-VGA) |
+| `boot_vga` | `1` (firmware posted on it) | file absent |
+| `power/control` | `auto` | `on` |
+
+Do not use `boot_vga` or PCI class to decide which card is the display GPU.
+`power/control=auto` is the property this tool actually depends on: it refuses
+to write to any device that is not runtime-PM managed, which on this machine
+is exactly what keeps a mistyped identity from ever tuning the iGPU.
+
 ## Runtime PM
 
 - `power/control=auto`; idle → `runtime_status=suspended`, `power_state=D3cold`.
