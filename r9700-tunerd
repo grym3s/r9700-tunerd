@@ -378,13 +378,31 @@ def drm_names(pci: Path) -> dict[str, str]:
 
 
 def hwmon_dir(pci: Path) -> Path | None:
+    """Return the hwmonN directory for this GPU.
+
+    Candidates are sorted numerically by N (lexical sort would put hwmon12
+    before hwmon7).  After a driver rebind, stale hwmon entries can linger
+    without power1_cap; prefer the first (lowest N) candidate that actually
+    contains power1_cap, falling back to the first numeric candidate.
+    """
     hroot = pci / "hwmon"
     if not hroot.is_dir():
         return None
-    for child in sorted(hroot.iterdir()):
+    candidates: list[tuple[int, Path]] = []
+    for child in hroot.iterdir():
         if child.name.startswith("hwmon"):
-            return child
-    return None
+            suffix = child.name[len("hwmon"):]
+            if suffix.isdigit():
+                candidates.append((int(suffix), child))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0])
+    # Prefer first candidate with power1_cap (stale entries after rebind
+    # may lack it); fall back to first numeric candidate.
+    for _, path in candidates:
+        if (path / "power1_cap").is_file():
+            return path
+    return candidates[0][1]
 
 
 def parse_od(text: str) -> dict:
@@ -398,6 +416,13 @@ def parse_od(text: str) -> dict:
         if s.startswith("OD_VDDGFX_OFFSET"):
             in_offset = True
             in_range = False
+            # The header line itself may carry a value, e.g.
+            # "OD_VDDGFX_OFFSET: -25mV" (one-line form).  Capture it;
+            # the two-line form (header then value on next line) still works
+            # because the regex simply won't match a bare header.
+            m = re.search(r"(-?\d+)\s*mV", s, re.I)
+            if m:
+                current_mv = int(m.group(1))
             continue
         if s.startswith("OD_RANGE"):
             in_range = True
@@ -690,7 +715,7 @@ def cmd_reset(conf: dict) -> int:
     if not is_active(pci):
         log(f"reset skipped: runtime_status={runtime_status(pci)}")
         return 0
-    # Runtime-PM write guard: refuse before any sysfs write.
+    # Runtime-PM write guard: refuse before touching the config file.
     try:
         require_runtime_pm(pci)
     except RuntimeError as e:
@@ -834,13 +859,27 @@ def cmd_watch(conf: dict) -> int:
     last_unknown_warn: str | None = None
     was_present = pci is not None
     susp_at_last_wake: int | None = None
+    # Tracks whether the last counter read succeeded (for dedup of the
+    # "unreadable" warning: only log when transitioning good→None).
+    _susp_prev_ok = False
 
     # Initial edge: if already active, treat as unconfigured (boot / daemon start).
     if pci is not None and is_active(pci):
         state = ST_ACTIVE_UNCONFIGURED
         cap_checked = handle_wake(pci, last_good, cap_checked)
         state = ST_ACTIVE_CONFIGURED
-        susp_at_last_wake = runtime_suspended_ms(pci)
+        # Update baseline with None-safety: never overwrite a good value.
+        _new_susp = runtime_suspended_ms(pci)
+        if _new_susp is None:
+            if _susp_prev_ok:
+                log(
+                    "runtime_suspended_time unreadable; counter wake detection degraded",
+                    syslog.LOG_WARNING,
+                )
+            _susp_prev_ok = False
+        else:
+            susp_at_last_wake = _new_susp
+            _susp_prev_ok = True
     elif pci is not None:
         state = ST_SUSPENDED
 
@@ -884,6 +923,7 @@ def cmd_watch(conf: dict) -> int:
                     was_present = False
                 state = ST_SUSPENDED
                 susp_at_last_wake = None
+                _susp_prev_ok = False
                 time.sleep(interval)
                 continue
 
@@ -895,19 +935,46 @@ def cmd_watch(conf: dict) -> int:
             # Only "active" is a rising edge; only "suspended" is a falling edge.
             # "unreadable:...", "suspending", "resuming" are NOT transitions.
             if st == "active":
-                now_susp = runtime_suspended_ms(pci)
                 wake_detected = False
                 via_counter = False
 
                 if state == ST_SUSPENDED:
+                    # Plain edge (suspended→active): no counter read needed.
                     wake_detected = True
-                elif (
-                    now_susp is not None
-                    and susp_at_last_wake is not None
-                    and now_susp > susp_at_last_wake
-                ):
-                    wake_detected = True
-                    via_counter = True
+                else:
+                    # Counter-based detection (only when the edge path did
+                    # not already fire, to avoid an extra sysfs read).
+                    now_susp = runtime_suspended_ms(pci)
+                    # A counter that stops being readable while active means
+                    # detection is degraded until it returns; say so once.
+                    if now_susp is None:
+                        if _susp_prev_ok:
+                            log(
+                                "runtime_suspended_time unreadable; counter wake detection degraded",
+                                syslog.LOG_WARNING,
+                            )
+                        _susp_prev_ok = False
+                    elif not _susp_prev_ok and susp_at_last_wake is not None:
+                        _susp_prev_ok = True
+                    if (
+                        now_susp is not None
+                        and susp_at_last_wake is not None
+                        and now_susp > susp_at_last_wake
+                    ):
+                        wake_detected = True
+                        via_counter = True
+                    elif (
+                        now_susp is not None
+                        and susp_at_last_wake is not None
+                        and now_susp < susp_at_last_wake
+                    ):
+                        # Driver rebind/reset reset the counter to a lower value.
+                        log(
+                            f"runtime_suspended_time regressed "
+                            f"({susp_at_last_wake}→{now_susp}); driver rebind?",
+                            syslog.LOG_WARNING,
+                        )
+                        wake_detected = True
 
                 if wake_detected:
                     if via_counter:
@@ -918,7 +985,18 @@ def cmd_watch(conf: dict) -> int:
                     state = ST_ACTIVE_UNCONFIGURED
                     cap_checked = handle_wake(pci, conf_now, cap_checked)
                     state = ST_ACTIVE_CONFIGURED
-                    susp_at_last_wake = runtime_suspended_ms(pci)
+                    # Update baseline with None-safety.
+                    _new_susp = runtime_suspended_ms(pci)
+                    if _new_susp is None:
+                        if _susp_prev_ok:
+                            log(
+                                "runtime_suspended_time unreadable; counter wake detection degraded",
+                                syslog.LOG_WARNING,
+                            )
+                        _susp_prev_ok = False
+                    else:
+                        susp_at_last_wake = _new_susp
+                        _susp_prev_ok = True
             elif st == "suspended":
                 if state != ST_SUSPENDED:
                     log("R9700 runtime suspended")
@@ -927,6 +1005,10 @@ def cmd_watch(conf: dict) -> int:
             # else: transitional/unreadable — just sleep and poll again
         except Exception as e:
             log(f"watcher loop error: {e}", syslog.LOG_WARNING)
+            # Reset so a failure inside the wake path cannot leave the
+            # machine stuck in ACTIVE_UNCONFIGURED; the next active poll
+            # re-applies once via the edge path.
+            state = ST_SUSPENDED
         time.sleep(interval)
 
     log("watcher stopping")

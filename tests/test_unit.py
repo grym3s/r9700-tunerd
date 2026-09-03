@@ -40,6 +40,15 @@ def test_parse_od_empty():
     assert r["max_mv"] is None
 
 
+def test_parse_od_value_on_header_line():
+    """One-line form: OD_VDDGFX_OFFSET: -25mV on the header itself."""
+    text = "OD_VDDGFX_OFFSET: -25mV\nOD_RANGE:\nVDDGFX_OFFSET: -200mV 0mV"
+    r = rt.parse_od(text)
+    assert r["current_mv"] == -25
+    assert r["min_mv"] == -200
+    assert r["max_mv"] == 0
+
+
 # ===================================================================
 # load_conf
 # ===================================================================
@@ -720,3 +729,232 @@ def test_watch_counter_unreadable_falls_back_to_edges(
     result = rt.cmd_watch(conf)
     assert result == 0
     assert wake_count == 2  # initial + edge-detected
+
+
+# ===================================================================
+# cmd_watch — Patch 3b review fixes
+# ===================================================================
+
+
+def test_counter_none_after_wake_keeps_previous_baseline(
+    fake_tree, conf, log_recorder, monkeypatch, tmp_path
+):
+    """Counter file removed after first wake → baseline kept, one warning,
+    later growth still detected when the file returns."""
+    pci = fake_tree / "0000:aa:00.0"
+    susp_file = pci / "power" / "runtime_suspended_time"
+
+    conf_file = tmp_path / "watch.conf"
+    conf_file.write_text(
+        "VENDOR=0x1002\n"
+        "DEVICE=0x7551\n"
+        "SUBSYSTEM_VENDOR=0x1043\n"
+        "SUBSYSTEM_DEVICE=0x0626\n"
+        "POWER_LIMIT_W=210\n"
+        "VOLTAGE_OFFSET_MV=0\n"
+        "POLL_INTERVAL_S=2\n"
+    )
+    monkeypatch.setattr(rt, "CONF_PATH", conf_file)
+
+    rt._stop = False
+    rt._last_pm_refusal = None
+    rt._last_kernel_scan = 0.0
+
+    wake_count = 0
+
+    def fake_handle_wake(p, c, cc):
+        nonlocal wake_count
+        wake_count += 1
+        return True
+
+    monkeypatch.setattr(rt, "handle_wake", fake_handle_wake)
+
+    # Sequence:
+    #   Startup: active → wake 1, susp_at_last_wake=1000, _susp_prev_ok=True
+    #   Iter 1: active, state=ACTIVE_CONFIGURED → read counter → None
+    #           → keep 1000, log warning (prev was OK), _susp_prev_ok=False
+    #   sleep 1: remove counter file (already gone after iter 1 read)
+    #   Iter 2: active, state=ACTIVE_CONFIGURED → read counter → 2000 > 1000
+    #           → wake 2
+    #   sleep 2: stop
+    sleep_count = 0
+
+    def fake_sleep(*args, **kwargs):
+        nonlocal sleep_count
+        sleep_count += 1
+        if sleep_count == 1:
+            # Remove the counter file so the next poll's read returns None.
+            susp_file.unlink()
+        elif sleep_count == 2:
+            # Restore with a higher value; the NEXT poll must detect growth.
+            susp_file.write_text("2000\n")
+        elif sleep_count == 3:
+            rt._stop = True
+
+    monkeypatch.setattr(rt.time, "sleep", fake_sleep)
+
+    result = rt.cmd_watch(conf)
+    assert result == 0
+    assert wake_count == 2  # startup + growth-detected
+
+    # Exactly one "unreadable" warning (deduped: only logged on good→None transition)
+    unreadable_warnings = [
+        msg for level, msg in log_recorder
+        if "runtime_suspended_time unreadable" in msg
+    ]
+    assert len(unreadable_warnings) == 1
+
+
+def test_counter_regression_treated_as_wake(
+    fake_tree, conf, log_recorder, monkeypatch, tmp_path
+):
+    """baseline 42000, next read 0 → handle_wake once, WARNING contains
+    'regressed', baseline becomes 0."""
+    pci = fake_tree / "0000:aa:00.0"
+    susp_file = pci / "power" / "runtime_suspended_time"
+    susp_file.write_text("42000\n")
+
+    conf_file = tmp_path / "watch.conf"
+    conf_file.write_text(
+        "VENDOR=0x1002\n"
+        "DEVICE=0x7551\n"
+        "SUBSYSTEM_VENDOR=0x1043\n"
+        "SUBSYSTEM_DEVICE=0x0626\n"
+        "POWER_LIMIT_W=210\n"
+        "VOLTAGE_OFFSET_MV=0\n"
+        "POLL_INTERVAL_S=2\n"
+    )
+    monkeypatch.setattr(rt, "CONF_PATH", conf_file)
+
+    rt._stop = False
+    rt._last_pm_refusal = None
+    rt._last_kernel_scan = 0.0
+
+    wake_count = 0
+
+    def fake_handle_wake(p, c, cc):
+        nonlocal wake_count
+        wake_count += 1
+        return True
+
+    monkeypatch.setattr(rt, "handle_wake", fake_handle_wake)
+
+    # Sequence:
+    #   Startup: active → wake 1, susp_at_last_wake=42000
+    #   Iter 1: active, state=ACTIVE_CONFIGURED → counter=42000, no change → no wake
+    #   sleep 1: set counter to 0 (simulates driver rebind/reset)
+    #   Iter 2: active, state=ACTIVE_CONFIGURED → counter=0 < 42000 → regression!
+    #           → WARNING, wake 2, susp_at_last_wake=0
+    #   sleep 2: (no-op)
+    #   Iter 3: active, state=ACTIVE_CONFIGURED → counter=0, not < 0 → no wake
+    #   sleep 3: stop
+    sleep_count = 0
+
+    def fake_sleep(*args, **kwargs):
+        nonlocal sleep_count
+        sleep_count += 1
+        if sleep_count == 1:
+            susp_file.write_text("0\n")
+        elif sleep_count == 3:
+            rt._stop = True
+
+    monkeypatch.setattr(rt.time, "sleep", fake_sleep)
+
+    result = rt.cmd_watch(conf)
+    assert result == 0
+    assert wake_count == 2  # startup + regression-detected
+
+    # WARNING must contain "regressed" and the old→new values.
+    regressed_warnings = [
+        msg for level, msg in log_recorder if "regressed" in msg
+    ]
+    assert len(regressed_warnings) == 1
+    assert "42000" in regressed_warnings[0]
+    assert "0" in regressed_warnings[0]
+
+
+def test_loop_exception_resets_state(
+    fake_tree, conf, log_recorder, monkeypatch, tmp_path
+):
+    """monkeypatch handle_wake to raise once → next active poll calls
+    handle_wake again (state was reset to SUSPENDED by the except handler)."""
+    pci = fake_tree / "0000:aa:00.0"
+
+    conf_file = tmp_path / "watch.conf"
+    conf_file.write_text(
+        "VENDOR=0x1002\n"
+        "DEVICE=0x7551\n"
+        "SUBSYSTEM_VENDOR=0x1043\n"
+        "SUBSYSTEM_DEVICE=0x0626\n"
+        "POWER_LIMIT_W=210\n"
+        "VOLTAGE_OFFSET_MV=0\n"
+        "POLL_INTERVAL_S=2\n"
+    )
+    monkeypatch.setattr(rt, "CONF_PATH", conf_file)
+
+    rt._stop = False
+    rt._last_pm_refusal = None
+    rt._last_kernel_scan = 0.0
+
+    wake_calls: list[int] = []
+
+    def fake_handle_wake(p, c, cc):
+        wake_calls.append(1)
+        if len(wake_calls) == 2:
+            raise RuntimeError("simulated failure in wake path")
+        return True
+
+    monkeypatch.setattr(rt, "handle_wake", fake_handle_wake)
+
+    # Sequence:
+    #   Startup: active → handle_wake (call 1, OK) → state=ACTIVE_CONFIGURED
+    #   Iter 1: active, state=ACTIVE_CONFIGURED → no wake → sleep 1 (→ suspended)
+    #   Iter 2: suspended → state=SUSPENDED → sleep 2 (→ active)
+    #   Iter 3: active, state=SUSPENDED → edge wake → handle_wake (call 2, RAISES)
+    #           → except → state=SUSPENDED → sleep 3
+    #   Iter 4: active, state=SUSPENDED → edge wake → handle_wake (call 3, OK)
+    #           → sleep 4 (stop)
+    sleep_count = 0
+
+    def fake_sleep(*args, **kwargs):
+        nonlocal sleep_count
+        sleep_count += 1
+        if sleep_count == 1:
+            (pci / "power" / "runtime_status").write_text("suspended\n")
+        elif sleep_count == 2:
+            (pci / "power" / "runtime_status").write_text("active\n")
+        elif sleep_count == 4:
+            rt._stop = True
+
+    monkeypatch.setattr(rt.time, "sleep", fake_sleep)
+
+    result = rt.cmd_watch(conf)
+    assert result == 0
+    assert len(wake_calls) == 3  # startup + failed + retry
+
+    # The exception was logged by the except handler.
+    error_msgs = [
+        msg for level, msg in log_recorder if "watcher loop error" in msg
+    ]
+    assert len(error_msgs) == 1
+    assert "simulated failure" in error_msgs[0]
+
+
+def test_hwmon_dir_numeric_sort_and_power1_cap(fake_tree):
+    """hwmon12 without power1_cap and hwmon7 with it → hwmon7 chosen.
+
+    Lexical sort would pick hwmon12 first; numeric sort + power1_cap
+    preference must pick hwmon7.
+    """
+    pci = fake_tree / "0000:aa:00.0"
+    hroot = pci / "hwmon"
+
+    # hwmon7 already exists in the fixture with power1_cap.
+    # Add hwmon12 WITHOUT power1_cap (simulates a stale post-rebind entry).
+    hwmon12 = hroot / "hwmon12"
+    hwmon12.mkdir()
+    (hwmon12 / "temp1_input").write_text("45000\n")  # some sensor, but no power1_cap
+
+    result = rt.hwmon_dir(pci)
+    assert result is not None
+    assert result.name == "hwmon7"
