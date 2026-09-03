@@ -462,6 +462,9 @@ class Handler(BaseHTTPRequestHandler):
             return None
         try:
             length = int(self.headers.get("Content-Length", 0))
+            if length < 0:
+                self._err(400, "invalid Content-Length")
+                return None
         except (ValueError, TypeError):
             self._err(400, "invalid or missing Content-Length")
             return None
