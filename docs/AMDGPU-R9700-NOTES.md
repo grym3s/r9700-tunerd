@@ -50,6 +50,23 @@ is exactly what keeps a mistyped identity from ever tuning the iGPU.
   unchanged). The watcher therefore treats "counter grew since the last handled
   wake" as a wake, whether or not a `suspended` sample was ever observed.
 
+## Sensor reads while active re-arm autosuspend (measured 2026-09-04)
+
+Every read of `hwmon/*`, `pp_od_clk_voltage`, `pp_dpm_*` or `gpu_busy_percent`
+takes a runtime-PM reference in amdgpu and restarts the 5 s autosuspend timer.
+A monitor that samples those files every 2 s therefore keeps an otherwise idle
+card in D0 indefinitely: with the dashboard polling at 2 s the card sat at
+`active`, `gpu_busy_percent=0`, for minutes after a benchmark; it reached D3cold
+16 s after the poller was stopped. Rules that follow:
+
+- The watcher never reads sensors on a poll; only on a wake (once).
+- Any live monitor must space sensor reads further apart than
+  `autosuspend_delay_ms` (5 s) whenever the card is not busy, so the card can
+  suspend between two samples. The dashboard uses 2 s while `gpu_busy >= 5 %`
+  and 9 s otherwise.
+- `power/runtime_status`, `power_state`, `power/runtime_suspended_time` and
+  `power/control` do not take that reference and are safe at any rate.
+
 ## Power cap (`hwmon/power1_cap`, microwatts)
 
 | min | default | max |
