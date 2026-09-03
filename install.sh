@@ -1,5 +1,5 @@
 #!/bin/bash
-# Install Phase A udev names + Phase B tunerd. Does NOT enable the watcher.
+# Install udev names, daemon, units and docs. Never touches the watcher's enable state.
 set -euo pipefail
 SRC="$(cd "$(dirname "$0")" && pwd)"
 STAMP=20260903-r9700
@@ -38,10 +38,17 @@ fi
 udevadm control --reload-rules
 udevadm trigger --subsystem-match=drm --action=add
 systemctl daemon-reload
-# Explicitly do not enable watcher until Phase A/B tests pass.
-systemctl disable r9700-tunerd.service >/dev/null 2>&1 || true
+# Do not change the watcher's enablement: Phase C accepted it, and a reinstall
+# must never silently disable a service that is expected to start at boot.
+if systemctl is-enabled --quiet r9700-tunerd.service; then
+  echo "watcher is enabled (unchanged); restart it to pick up the new build:"
+  echo "  sudo systemctl restart r9700-tunerd.service"
+else
+  echo "watcher is NOT enabled; enable it after the hardware tests pass:"
+  echo "  sudo systemctl enable --now r9700-tunerd.service"
+fi
 
 sleep 0.5
 echo "=== /dev/dri after udev ==="
 ls -l /dev/dri/r9700 /dev/dri/amd-igpu /dev/dri/strix-halo /dev/dri/card* 2>/dev/null || ls -l /dev/dri
-echo "install complete; watcher NOT enabled"
+echo "install complete"

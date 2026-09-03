@@ -20,7 +20,7 @@ keep-last-good-config behaviour.
 Reads identity and targets from `/etc/r9700-tunerd.conf`; never uses card
 numbers or bus addresses; only reads `power/runtime_status` and `power_state`
 while the card is suspended; always closes the render node it opens. Output goes
-to stdout and is appended to `/tmp/r9700-hwtest.log`.
+to stdout and is appended to `/var/log/r9700-hwtest.log`.
 
 | subcommand | what it proves |
 |---|---|

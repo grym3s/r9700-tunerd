@@ -16,7 +16,9 @@ from pathlib import Path
 
 CONF = Path("/etc/r9700-tunerd.conf")
 PCI_ROOT = Path("/sys/bus/pci/devices")
-LOG = Path("/tmp/r9700-hwtest.log")
+# Not /tmp: with fs.protected_regular=1 root cannot append to a file another
+# user created in the sticky /tmp, which is exactly what an earlier dry run does.
+LOG = Path("/var/log/r9700-hwtest.log")
 SERVICE = "r9700-tunerd.service"
 
 # Known-benign kernel messages on every RDNA4 resume (OD table re-upload fails
