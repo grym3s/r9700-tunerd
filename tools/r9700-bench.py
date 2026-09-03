@@ -346,6 +346,11 @@ def _extract_metrics(data: dict) -> dict:
         t = data["timings"]
         r["gen_tok_s"] = t.get("predicted_per_second")
         r["prompt_tok_s"] = t.get("prompt_per_second")
+        # Speculative decoding metrics (llama.cpp)
+        if "draft_n" in t and r.get("draft_tokens") is None:
+            r["draft_tokens"] = t["draft_n"]
+        if "draft_accepted" in t and r.get("accepted_tokens") is None:
+            r["accepted_tokens"] = t["draft_accepted"]
 
     # Throughput: LM Studio uses stats.tokens_per_second
     if "stats" in data:
@@ -464,13 +469,34 @@ def cmd_run(args):
     sampler.stop()
     csv_file.close()
 
+    # ── Fallback: if pre-run read returned None (card was suspended at
+    #    start), use the first active sampler row as the tuning baseline. ──
+    baseline_source = "pre-run"
+    if pre["vddgfx_offset_mv"] is None or pre["power_cap_w"] is None:
+        first_active = next(
+            (row for row in sampler.rows if row.get("runtime_status") == "active"),
+            None,
+        )
+        if first_active is not None:
+            if pre["vddgfx_offset_mv"] is None and "vddgfx_offset_mv" in first_active:
+                pre["vddgfx_offset_mv"] = first_active["vddgfx_offset_mv"]
+            if pre["power_cap_w"] is None and "power_cap_w" in first_active:
+                pre["power_cap_w"] = first_active["power_cap_w"]
+            baseline_source = "first active sample"
+
     # ── Aggregates ──
     ok = [r for r in results if not r["error"]]
     errors = [r for r in results if r["error"]]
     gen_list = [r["gen_tok_s"] for r in ok if r.get("gen_tok_s") is not None]
+    prompt_list = [r["prompt_tok_s"] for r in ok if r.get("prompt_tok_s") is not None]
     total_comp = sum(r.get("completion_tokens", 0) for r in ok)
     total_wall = sum(r["wall_s"] for r in ok)
     agg_tok_s = total_comp / total_wall if total_wall > 0 else 0.0
+
+    # Draft acceptance (speculative decoding)
+    total_draft = sum(r.get("draft_tokens", 0) for r in ok)
+    total_accepted = sum(r.get("accepted_tokens", 0) for r in ok)
+    draft_acceptance = (total_accepted / total_draft) if total_draft > 0 else None
 
     active_rows = [row for row in sampler.rows if row.get("runtime_status") == "active"]
     powers = [row["power_w"] for row in active_rows if "power_w" in row]
@@ -512,10 +538,12 @@ def cmd_run(args):
         "endpoint": args.endpoint,
         "model": args.model,
         "pre_run": pre,
+        "baseline_source": baseline_source,
         "requests": results,
         "aggregates": {
             "mean_gen_tok_s": round(mean(gen_list), 2) if gen_list else None,
             "median_gen_tok_s": round(median(gen_list), 2) if gen_list else None,
+            "mean_prompt_tok_s": round(mean(prompt_list), 2) if prompt_list else None,
             "agg_tok_s": round(agg_tok_s, 2),
             "total_completion_tokens": total_comp,
             "total_wall_s": round(total_wall, 2),
@@ -529,6 +557,9 @@ def cmd_run(args):
             "offset_stable": offset_stable,
             "cap_stable": cap_stable,
             "energy_j": round(energy_j, 1),
+            "draft_acceptance": round(draft_acceptance, 4) if draft_acceptance is not None else None,
+            "draft_tokens_total": total_draft,
+            "accepted_tokens_total": total_accepted,
         },
         "errors": [r["error"] for r in errors],
         "d3cold_s": round(d3cold_s, 2) if d3cold_s is not None else None,
@@ -542,14 +573,19 @@ def cmd_run(args):
     print(f"  R9700 bench  {label}  {ts_str}")
     print(f"{'='*60}")
     print(f"  Model:          {args.model}")
-    print(f"  Offset:         {pre['vddgfx_offset_mv']} mV  (stable: {offset_stable})")
-    print(f"  Cap:            {pre['power_cap_w']} W   (stable: {cap_stable})")
+    print(f"  Offset:         {pre['vddgfx_offset_mv']} mV  (stable: {offset_stable}, source: {baseline_source})")
+    print(f"  Cap:            {pre['power_cap_w']} W   (stable: {cap_stable}, source: {baseline_source})")
     print(f"  Gen tok/s:      mean={a['mean_gen_tok_s']}  median={a['median_gen_tok_s']}")
+    print(f"  Prompt tok/s:   mean={a['mean_prompt_tok_s']}")
     print(f"  Agg tok/s:      {a['agg_tok_s']}  ({total_comp} tok / {a['total_wall_s']} s)")
     print(f"  Power:          mean={a['mean_power_w']} W  max={a['max_power_w']} W")
     print(f"  Efficiency:     {a['tok_s_per_w']} tok/s/W  {a['tok_per_joule']} tok/J")
     print(f"  Max junction:   {a['max_junction_c']} °C")
     print(f"  SCLK range:     {a['min_sclk_mhz']}–{a['max_sclk_mhz']} MHz")
+    if total_draft > 0:
+        print(f"  Draft accept:   {a['draft_acceptance']:.3f}  ({total_accepted}/{total_draft})")
+    else:
+        print(f"  Draft accept:   -")
     print(f"  Errors:         {len(errors)}")
     print(f"  D3cold:         {d3cold_s:.1f} s" if d3cold_s else "  D3cold:         TIMEOUT")
     print(f"{'='*60}")

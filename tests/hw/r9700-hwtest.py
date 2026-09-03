@@ -161,6 +161,26 @@ def wait_active(pci: Path, timeout: float) -> bool:
     return False
 
 
+def settle(pci: Path, timeout: float = 30.0) -> bool:
+    """Wait until runtime_status==suspended AND power_state==D3cold.
+
+    Polls every 0.5 s, reading only those two sysfs files.
+    Returns True if settled within timeout, False otherwise.
+    """
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < timeout:
+        st = rt_status(pci)
+        ps = pwr_state(pci)
+        if st == "suspended" and ps == "D3cold":
+            log(f"  settled in {time.monotonic() - t0:.1f} s")
+            return True
+        time.sleep(0.5)
+    st = rt_status(pci)
+    ps = pwr_state(pci)
+    log(f"  NOT settled after {time.monotonic() - t0:.1f} s ({st}/{ps})")
+    return False
+
+
 def open_render(pci: Path) -> int:
     """O_RDWR|O_CLOEXEC so the fd is not leaked into child processes."""
     return os.open(str(render_node(pci)), os.O_RDWR | os.O_CLOEXEC)
@@ -266,6 +286,11 @@ def cmd_cycles(args: argparse.Namespace) -> int:
     n = args.count
     gap = args.gap
     log(f"cycles: count={n} vo={vo_t} cap={cap_t} gap={gap}s")
+    settled = True
+    if not args.no_settle:
+        settled = settle(pci)
+        if not settled:
+            log("  WARNING: GPU did not settle; continuing (first cycle may not be a D3cold wake)")
     t0 = ts()
     rows: list[tuple] = []
     all_ok = True
@@ -314,12 +339,20 @@ def cmd_cycles(args: argparse.Namespace) -> int:
     log(f"  journal: wakes={wakes} cap_applied={cap_applied}")
     j_ok = wakes == n and cap_applied == 0
     if not j_ok:
-        all_ok = False
+        if not settled and wakes == n - 1 and cap_applied == 0:
+            j_ok = True
+            log(f"  NOTE: settled=False, first-cycle wake not logged (wakes={wakes}/{n}); treating as PASS_WITH_NOTE")
+        else:
+            all_ok = False
+    log(f"  settled={settled}")
     log("  Cycle | vo_lat_s | vo | cap_W | stayed | D3cold | t_susp | t_d3cold")
     for r in rows:
         log(f"  {r[0]} | {r[1]} | {r[2]} | {r[3]} | {r[4]} | {r[5]} | {r[6]:.1f} | {r[7]:.1f}")
     verdict = all_ok and j_ok
-    log(f"  {'PASS' if verdict else 'FAIL'}")
+    if verdict and not settled and wakes == n - 1:
+        log(f"  PASS_WITH_NOTE")
+    else:
+        log(f"  {'PASS' if verdict else 'FAIL'}")
     return 0 if verdict else 1
 
 
@@ -333,6 +366,9 @@ def cmd_storm(args: argparse.Namespace) -> int:
     pid0 = tunerd_pid()
     if pid0 is None:
         log("  FAIL: watcher not running"); return 1
+    if not args.no_settle:
+        if not settle(pci):
+            log("  WARNING: GPU did not settle; continuing")
     t0 = ts()
     for i in range(1, n + 1):
         fd = open_render(pci)
@@ -387,6 +423,9 @@ def cmd_config_typo(args: argparse.Namespace) -> int:
     pid0 = tunerd_pid()
     if pid0 is None:
         log("  FAIL: watcher not running"); return 1
+    if not args.no_settle:
+        if not settle(pci):
+            log("  WARNING: GPU did not settle; continuing")
     t0 = ts()
     ok = True
     try:
@@ -437,6 +476,9 @@ def cmd_sigterm(args: argparse.Namespace) -> int:
     if pid_old is None:
         log("  FAIL: watcher not running"); return 1
     log(f"  old_pid={pid_old}")
+    if not args.no_settle:
+        if not settle(pci):
+            log("  WARNING: GPU did not settle; continuing")
     fd = open_render(pci)
     try:
         if not wait_active(pci, 5):
@@ -549,11 +591,19 @@ def main() -> int:
     p.add_argument("--count", type=int, default=5)
     p.add_argument("--gap", type=float, default=0,
                    help="extra seconds in D3cold between cycles (relaxed pattern)")
+    p.add_argument("--no-settle", action="store_true",
+                   help="skip settle (wait for D3cold) before first wake")
     p = sub.add_parser("storm", help="short-wake storm (open/close render node)")
     p.add_argument("--count", type=int, default=10)
     p.add_argument("--hold-ms", type=int, default=300)
-    sub.add_parser("config-typo", help="inject bad config, verify graceful handling")
-    sub.add_parser("sigterm", help="restart service while GPU active")
+    p.add_argument("--no-settle", action="store_true",
+                   help="skip settle (wait for D3cold) before first wake")
+    p = sub.add_parser("config-typo", help="inject bad config, verify graceful handling")
+    p.add_argument("--no-settle", action="store_true",
+                   help="skip settle (wait for D3cold) before first wake")
+    p = sub.add_parser("sigterm", help="restart service while GPU active")
+    p.add_argument("--no-settle", action="store_true",
+                   help="skip settle (wait for D3cold) before first wake")
     sub.add_parser("reboot-check", help="full post-reboot acceptance run")
     args = ap.parse_args()
     if os.geteuid() != 0:

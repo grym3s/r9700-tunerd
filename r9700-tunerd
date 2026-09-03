@@ -773,6 +773,27 @@ def cmd_set_undervolt(conf: dict, mv: int) -> int:
     return cmd_apply(conf)
 
 
+def cmd_set_power_cap(conf: dict, watts: int) -> int:
+    """Set POWER_LIMIT_W in config and apply. Mirrors cmd_set_undervolt."""
+    pci = discover(conf)
+    assert pci is not None
+    if is_active(pci):
+        cap = read_power_cap(pci)
+        min_w = cap["min"] / 1_000_000
+        max_w = cap["max"] / 1_000_000
+        if watts < min_w or watts > max_w:
+            die(f"{watts} W outside live range {min_w:.0f}..{max_w:.0f} W")
+    # Runtime-PM write guard: die before touching the config file.
+    try:
+        require_runtime_pm(pci)
+    except RuntimeError as e:
+        die(str(e))
+    set_conf_value(CONF_PATH, "POWER_LIMIT_W", str(watts))
+    log(f"config POWER_LIMIT_W={watts}")
+    conf["POWER_LIMIT_W"] = watts  # keep validated-dict type (int)
+    return cmd_apply(conf)
+
+
 def handle_wake(pci: Path, conf: dict, cap_checked: bool) -> bool:
     """Rising-edge handler. Returns new cap_checked flag.
 
@@ -1048,6 +1069,8 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("reset")
     su = sub.add_parser("set-undervolt")
     su.add_argument("mv", type=int, help="VDDGFX offset in mV, e.g. -25")
+    spc = sub.add_parser("set-power-cap")
+    spc.add_argument("watts", type=int, help="Power cap in watts, e.g. 250")
     sp = sub.add_parser("probe-poll")
     sp.add_argument("--seconds", type=int, default=30)
     return p
@@ -1081,6 +1104,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_reset(conf)
     if args.cmd == "set-undervolt":
         return cmd_set_undervolt(conf, args.mv)
+    if args.cmd == "set-power-cap":
+        return cmd_set_power_cap(conf, args.watts)
     if args.cmd == "probe-poll":
         return cmd_probe_poll(conf, seconds=args.seconds)
     return 2

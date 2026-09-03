@@ -958,3 +958,63 @@ def test_hwmon_dir_numeric_sort_and_power1_cap(fake_tree):
     result = rt.hwmon_dir(pci)
     assert result is not None
     assert result.name == "hwmon7"
+
+
+# ===================================================================
+# cmd_set_power_cap
+# ===================================================================
+
+
+def test_set_power_cap_updates_conf_and_applies(fake_tree, conf, monkeypatch, tmp_path):
+    """Active card, cap 250 within live range → config updated, cmd_apply called."""
+    pci = fake_tree / "0000:aa:00.0"
+    hwmon = pci / "hwmon" / "hwmon7"
+    (hwmon / "power1_cap_min").write_text("210000000\n")
+    (hwmon / "power1_cap_max").write_text("330000000\n")
+    (hwmon / "power1_cap").write_text("210000000\n")
+    (hwmon / "power1_cap_default").write_text("250000000\n")
+
+    conf_file = tmp_path / "test.conf"
+    conf_file.write_text("POWER_LIMIT_W=210\nVOLTAGE_OFFSET_MV=0\n")
+    monkeypatch.setattr(rt, "CONF_PATH", conf_file)
+
+    apply_calls: list[dict] = []
+
+    def fake_cmd_apply(c):
+        apply_calls.append(dict(c))
+        return 0
+
+    monkeypatch.setattr(rt, "cmd_apply", fake_cmd_apply)
+
+    result = rt.cmd_set_power_cap(conf, 250)
+    assert result == 0
+
+    # Config file now says 250
+    text = conf_file.read_text(encoding="utf-8")
+    assert "POWER_LIMIT_W=250" in text
+
+    # cmd_apply was invoked with the updated conf
+    assert len(apply_calls) == 1
+    assert apply_calls[0]["POWER_LIMIT_W"] == 250
+
+
+def test_set_power_cap_rejects_out_of_range(fake_tree, conf, monkeypatch, tmp_path):
+    """Live range 210..330, request 400 → SystemExit, config unchanged."""
+    pci = fake_tree / "0000:aa:00.0"
+    hwmon = pci / "hwmon" / "hwmon7"
+    (hwmon / "power1_cap_min").write_text("210000000\n")
+    (hwmon / "power1_cap_max").write_text("330000000\n")
+    (hwmon / "power1_cap").write_text("210000000\n")
+    (hwmon / "power1_cap_default").write_text("250000000\n")
+
+    conf_file = tmp_path / "test.conf"
+    conf_file.write_text("POWER_LIMIT_W=210\nVOLTAGE_OFFSET_MV=0\n")
+    monkeypatch.setattr(rt, "CONF_PATH", conf_file)
+
+    with pytest.raises(SystemExit):
+        rt.cmd_set_power_cap(conf, 400)
+
+    # Config unchanged
+    text = conf_file.read_text(encoding="utf-8")
+    assert "POWER_LIMIT_W=210" in text
+    assert "POWER_LIMIT_W=400" not in text
