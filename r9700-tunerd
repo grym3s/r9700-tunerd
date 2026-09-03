@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import errno
+import json
 import os
 import re
 import signal
@@ -25,6 +26,7 @@ from pathlib import Path
 
 CONF_PATH = Path("/etc/r9700-tunerd.conf")
 STATE_DIR = Path("/run/r9700-tunerd")
+RANGES_PATH = STATE_DIR / "ranges.json"
 PCI_ROOT = Path("/sys/bus/pci/devices")
 SYSLOG_IDENT = "r9700-tunerd"
 
@@ -492,6 +494,36 @@ def write_state(payload: str) -> None:
         pass
 
 
+def save_ranges(cap: dict, od: dict) -> None:
+    """Best-effort: persist live cap/OD ranges for offline validation. Never raises."""
+    try:
+        payload = {
+            "cap_min_w": cap["min"] / 1_000_000,
+            "cap_max_w": cap["max"] / 1_000_000,
+            "cap_default_w": cap["default"] / 1_000_000,
+            "vo_min_mv": od["min_mv"],
+            "vo_max_mv": od["max_mv"],
+            "ts": int(time.time()),
+        }
+        RANGES_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write(RANGES_PATH, json.dumps(payload).encode("utf-8"))
+    except Exception:
+        pass
+
+
+def load_ranges() -> dict | None:
+    """Load cached live ranges. Returns None if missing/invalid/any key None."""
+    try:
+        data = json.loads(RANGES_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    required = ("cap_min_w", "cap_max_w", "cap_default_w", "vo_min_mv", "vo_max_mv", "ts")
+    for k in required:
+        if k not in data or data[k] is None:
+            return None
+    return data
+
+
 class Transient(RuntimeError):
     """Retryable OD/sysfs glitch during SMU settle."""
 
@@ -553,8 +585,11 @@ def maybe_scan_kernel_fatals() -> None:
         log("kernel warning: " + fatals[-1], syslog.LOG_WARNING)
 
 
-def restore_voltage(pci: Path, conf: dict) -> str:
-    """Read-before-write VO restore. One logical apply per call (with bounded retries)."""
+def restore_voltage(pci: Path, conf: dict) -> tuple[str, dict]:
+    """Read-before-write VO restore. One logical apply per call (with bounded retries).
+
+    Returns (status_string, od_dict) where od_dict is the raw read_od result.
+    """
     # conf is validated: VOLTAGE_OFFSET_MV is already an int.
     want = conf["VOLTAGE_OFFSET_MV"]
 
@@ -574,7 +609,7 @@ def restore_voltage(pci: Path, conf: dict) -> str:
             f"{od['min_mv']}..{od['max_mv']} mV"
         )
     if od["current_mv"] == want:
-        return f"already {want}"
+        return f"already {want}", od
 
     def _write_and_read():
         if not is_active(pci):
@@ -588,11 +623,14 @@ def restore_voltage(pci: Path, conf: dict) -> str:
         return got
 
     got = od_attempts(pci, _write_and_read, settle=False)
-    return f"restored {got}"
+    return f"restored {got}", od
 
 
-def maybe_restore_cap(pci: Path, conf: dict, *, force_log: bool) -> str:
-    """Read cap; write only if it does not match config. Never on a guess."""
+def maybe_restore_cap(pci: Path, conf: dict, *, force_log: bool) -> tuple[str, dict]:
+    """Read cap; write only if it does not match config. Never on a guess.
+
+    Returns (status_string, cap_dict) where cap_dict is the raw read_power_cap result.
+    """
     # conf is validated: POWER_LIMIT_W is already an int.
     want = conf["POWER_LIMIT_W"]
 
@@ -610,7 +648,7 @@ def maybe_restore_cap(pci: Path, conf: dict, *, force_log: bool) -> str:
     if abs(cur_w - want) < 0.5:
         if force_log:
             log(f"power cap already {cur_w:.0f} W")
-        return f"already {cur_w:.0f}"
+        return f"already {cur_w:.0f}", cap
 
     def _write():
         write_power_cap(pci, want)
@@ -619,7 +657,7 @@ def maybe_restore_cap(pci: Path, conf: dict, *, force_log: bool) -> str:
 
     got = od_attempts(pci, _write, settle=False)
     log(f"power cap applied: {got:.0f} W")
-    return f"applied {got:.0f}"
+    return f"applied {got:.0f}", cap
 
 
 def cmd_discover(conf: dict) -> int:
@@ -644,6 +682,15 @@ def cmd_status(conf: dict) -> int:
     print(f"power_state={power_state(pci)}")
     if st != "active":
         print("sensors=skipped (not active; refusing to wake)")
+        cached = load_ranges()
+        if cached is not None:
+            age = int(time.time()) - cached["ts"]
+            print(
+                f"cached_ranges: cap={cached['cap_min_w']:.0f}..{cached['cap_max_w']:.0f} W "
+                f"(default={cached['cap_default_w']:.0f}) "
+                f"vo={cached['vo_min_mv']}..{cached['vo_max_mv']} mV "
+                f"(age={age}s)"
+            )
         return 0
     try:
         cap = read_power_cap(pci)
@@ -682,8 +729,9 @@ def apply_explicit(conf: dict, *, reason: str) -> str:
         except OSError:
             val = "unreadable"
         return f"skip control={val}"
-    cap_s = maybe_restore_cap(pci, conf, force_log=True)
-    vo_s = restore_voltage(pci, conf)
+    cap_s, cap_data = maybe_restore_cap(pci, conf, force_log=True)
+    vo_s, od_data = restore_voltage(pci, conf)
+    save_ranges(cap_data, od_data)
     if vo_s.startswith("restored"):
         mv = conf["VOLTAGE_OFFSET_MV"]
         log(f"VDDGFX offset applied: {mv} mV")
@@ -762,6 +810,19 @@ def cmd_set_undervolt(conf: dict, mv: int) -> int:
             die(f"{mv} mV below live min {od['min_mv']} mV")
         if od["max_mv"] is not None and mv > od["max_mv"]:
             die(f"{mv} mV above live max {od['max_mv']} mV")
+        if od["min_mv"] is not None and od["max_mv"] is not None:
+            cap = read_power_cap(pci)
+            save_ranges(cap, od)
+        log(f"set-undervolt: validated against live OD range {od['min_mv']}..{od['max_mv']} mV")
+    else:
+        cached = load_ranges()
+        if cached is None:
+            die("card is suspended and no cached range is available; run a workload once so the watcher can record the live range, then retry")
+        if mv < cached["vo_min_mv"]:
+            die(f"{mv} mV below cached min {cached['vo_min_mv']} mV")
+        if mv > cached["vo_max_mv"]:
+            die(f"{mv} mV above cached max {cached['vo_max_mv']} mV")
+        log(f"set-undervolt: validated against cached OD range {cached['vo_min_mv']}..{cached['vo_max_mv']} mV")
     # Runtime-PM write guard: die before touching the config file.
     try:
         require_runtime_pm(pci)
@@ -783,6 +844,17 @@ def cmd_set_power_cap(conf: dict, watts: int) -> int:
         max_w = cap["max"] / 1_000_000
         if watts < min_w or watts > max_w:
             die(f"{watts} W outside live range {min_w:.0f}..{max_w:.0f} W")
+        od = read_od(pci)
+        if od["min_mv"] is not None and od["max_mv"] is not None:
+            save_ranges(cap, od)
+        log(f"set-power-cap: validated against live range {min_w:.0f}..{max_w:.0f} W")
+    else:
+        cached = load_ranges()
+        if cached is None:
+            die("card is suspended and no cached range is available; run a workload once so the watcher can record the live range, then retry")
+        if watts < cached["cap_min_w"] or watts > cached["cap_max_w"]:
+            die(f"{watts} W outside cached range {cached['cap_min_w']:.0f}..{cached['cap_max_w']:.0f} W")
+        log(f"set-power-cap: validated against cached range {cached['cap_min_w']:.0f}..{cached['cap_max_w']:.0f} W")
     # Runtime-PM write guard: die before touching the config file.
     try:
         require_runtime_pm(pci)
@@ -823,12 +895,14 @@ def handle_wake(pci: Path, conf: dict, cap_checked: bool) -> bool:
         log("runtime PM guard OK again (power/control=auto)")
         _last_pm_refusal = None
 
+    od_data = None
     try:
-        result = restore_voltage(pci, conf)
+        result, od_data = restore_voltage(pci, conf)
         if result.startswith("restored"):
             log(f"VDDGFX offset restored: {want} mV")
         # already-correct: no extra log beyond runtime active
     except Exception as e:
+        od_data = None
         log(
             f"VDDGFX offset restore failed: {e}; leaving stock voltage",
             syslog.LOG_WARNING,
@@ -837,17 +911,21 @@ def handle_wake(pci: Path, conf: dict, cap_checked: bool) -> bool:
         # Still do a one-time/lost cap check; VO failure must not block the GPU.
     if not is_active(pci):
         return cap_checked
+    cap_data = None
     try:
         if not cap_checked:
-            maybe_restore_cap(pci, conf, force_log=True)
+            _cap_result, cap_data = maybe_restore_cap(pci, conf, force_log=True)
             cap_checked = True
         else:
             # Ordinary BACO: read; write only if the cap was actually lost.
-            maybe_restore_cap(pci, conf, force_log=False)
+            _cap_result, cap_data = maybe_restore_cap(pci, conf, force_log=False)
     except Exception as e:
+        cap_data = None
         log(f"power cap check failed: {e}", syslog.LOG_WARNING)
         if not cap_checked:
             cap_checked = True  # do not hammer
+    if od_data is not None and cap_data is not None:
+        save_ranges(cap_data, od_data)
     maybe_scan_kernel_fatals()
     write_state(f"pci={pci.name}\nstate=ACTIVE_CONFIGURED\nvo={want}\nts={int(time.time())}\n")
     return cap_checked

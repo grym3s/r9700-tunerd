@@ -268,8 +268,8 @@ def test_restore_voltage_writes_vo_then_commit(fake_tree, conf, monkeypatch):
 
     monkeypatch.setattr(rt, "write_text", fake_write_text)
 
-    result = rt.restore_voltage(pci, conf)
-    assert result == "restored -25"
+    result, od = rt.restore_voltage(pci, conf)
+    assert result == "restored -25" and od["min_mv"] == -200
 
     # Only the two OD writes should appear
     vo_writes = [v for p, v in writes if "pp_od_clk_voltage" in p]
