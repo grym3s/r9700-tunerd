@@ -17,6 +17,7 @@ import signal
 import subprocess
 import sys
 import syslog
+import tempfile
 import time
 from pathlib import Path
 
@@ -36,6 +37,8 @@ DEFAULTS = {
     "VOLTAGE_OFFSET_MV": "0",
     "POLL_INTERVAL_S": "2",
 }
+
+KNOWN_KEYS = frozenset(DEFAULTS.keys())
 
 SETTLE_S = 0.35
 RETRY_SLEEPS = (0.25, 0.5, 1.0)  # after first try: 4 attempts total
@@ -59,15 +62,45 @@ KERNEL_OD_NOISE = re.compile(
     re.I,
 )
 
+_HEX_RE = re.compile(r"^0x[0-9a-f]{4}$")
+
 _stop = False
+_runtime_pm_warned = False
+_last_kernel_scan = 0.0
+
+
+def _stderr_is_journal() -> bool:
+    """True only when stderr really is the systemd journal stream.
+
+    systemd exports JOURNAL_STREAM="<st_dev>:<st_ino>" of the stream it gave
+    the service. The variable is inherited by every descendant (a terminal
+    started from a systemd user service still carries it), so the presence
+    of the variable alone is not proof; compare it with our actual fd 2.
+    """
+    js = os.environ.get("JOURNAL_STREAM")
+    if not js:
+        return False
+    try:
+        dev, ino = js.split(":", 1)
+        st = os.fstat(2)
+        return st.st_dev == int(dev) and st.st_ino == int(ino)
+    except (ValueError, OSError):
+        return False
 
 
 def log(msg: str, level: int = syslog.LOG_INFO) -> None:
     syslog.syslog(level, msg)
-    # systemd already captures syslog into the journal. Printing too duplicates
-    # every line. Only print when attached to a terminal.
-    if sys.stdout.isatty():
-        print(msg, flush=True)
+    if level == syslog.LOG_INFO:
+        # INFO: visible on a terminal; suppressed under the journal to avoid
+        # duplicating lines that syslog already captured.
+        if sys.stdout.isatty():
+            print(msg, flush=True)
+    else:
+        # WARNING / ERR: must be visible to calling scripts even when stdout
+        # is not a TTY.  When stderr is the systemd journal stream the syslog
+        # call already lands in the journal, so printing would duplicate it.
+        if not _stderr_is_journal():
+            print(msg, file=sys.stderr, flush=True)
 
 
 def die(msg: str, code: int = 1) -> None:
@@ -80,11 +113,46 @@ def read_text(path: Path) -> str:
 
 
 def write_text(path: Path, value: str) -> None:
+    """Write value to path, looping until all bytes are written."""
+    data = value.encode("utf-8")
     fd = os.open(path, os.O_WRONLY | os.O_CLOEXEC)
     try:
-        os.write(fd, value.encode("utf-8"))
+        off = 0
+        while off < len(data):
+            n = os.write(fd, data[off:])
+            if n == 0:
+                raise OSError("write_text: os.write returned 0 (short write)")
+            off += n
     finally:
         os.close(fd)
+
+
+def _atomic_write(path: Path, data: bytes) -> None:
+    """Write data to path atomically via tempfile + os.replace in same directory."""
+    dir_ = path.parent
+    mode = 0o644
+    if path.is_file():
+        mode = path.stat().st_mode & 0o777
+    fd, tmp = tempfile.mkstemp(dir=str(dir_), prefix=".r9700-tunerd-")
+    try:
+        off = 0
+        while off < len(data):
+            n = os.write(fd, data[off:])
+            if n == 0:
+                raise OSError("atomic_write: os.write returned 0")
+            off += n
+        os.fchmod(fd, mode)
+        os.close(fd)
+        fd = -1
+        os.replace(tmp, str(path))
+    except BaseException:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def norm_hex(value: str) -> str:
@@ -106,6 +174,77 @@ def load_conf(path: Path = CONF_PATH) -> dict[str, str]:
     return data
 
 
+def validate_conf(conf: dict[str, str]) -> tuple[dict, list[str]]:
+    """Parse and validate a raw string config dict.
+
+    Returns (parsed_dict, problems).
+    Fatal problems: bad identity hex, unparsable or out-of-range numbers.
+    Non-fatal: unknown keys (reported but not fatal).
+    """
+    problems: list[str] = []
+    parsed: dict = {}
+
+    # Unknown keys — non-fatal
+    for k in conf:
+        if k not in KNOWN_KEYS:
+            problems.append(f"unknown key {k}")
+
+    # Identity hex fields: must match 0xNNNN
+    for key in ("VENDOR", "DEVICE", "SUBSYSTEM_VENDOR", "SUBSYSTEM_DEVICE"):
+        raw = conf.get(key, "")
+        if not raw:
+            problems.append(f"{key}: empty value")
+            parsed[key] = None
+            continue
+        v = norm_hex(raw)
+        if not _HEX_RE.match(v):
+            problems.append(f"{key}={v} does not match 0xNNNN")
+            parsed[key] = None
+        else:
+            parsed[key] = v
+
+    # POWER_LIMIT_W: int 50..1000
+    raw = conf.get("POWER_LIMIT_W", "")
+    try:
+        v = int(raw)
+        if v < 50 or v > 1000:
+            problems.append(f"POWER_LIMIT_W={v} out of range 50..1000")
+            parsed["POWER_LIMIT_W"] = None
+        else:
+            parsed["POWER_LIMIT_W"] = v
+    except (ValueError, TypeError):
+        problems.append(f"POWER_LIMIT_W={raw!r} is not a valid integer")
+        parsed["POWER_LIMIT_W"] = None
+
+    # VOLTAGE_OFFSET_MV: int -500..0
+    raw = conf.get("VOLTAGE_OFFSET_MV", "")
+    try:
+        v = int(raw)
+        if v < -500 or v > 0:
+            problems.append(f"VOLTAGE_OFFSET_MV={v} out of range -500..0")
+            parsed["VOLTAGE_OFFSET_MV"] = None
+        else:
+            parsed["VOLTAGE_OFFSET_MV"] = v
+    except (ValueError, TypeError):
+        problems.append(f"VOLTAGE_OFFSET_MV={raw!r} is not a valid integer")
+        parsed["VOLTAGE_OFFSET_MV"] = None
+
+    # POLL_INTERVAL_S: float 1.0..60.0
+    raw = conf.get("POLL_INTERVAL_S", "")
+    try:
+        v = float(raw)
+        if v < 1.0 or v > 60.0:
+            problems.append(f"POLL_INTERVAL_S={v} out of range 1.0..60.0")
+            parsed["POLL_INTERVAL_S"] = None
+        else:
+            parsed["POLL_INTERVAL_S"] = v
+    except (ValueError, TypeError):
+        problems.append(f"POLL_INTERVAL_S={raw!r} is not a valid number")
+        parsed["POLL_INTERVAL_S"] = None
+
+    return parsed, problems
+
+
 def pci_ids(dev: Path) -> tuple[str, str, str, str] | None:
     try:
         return (
@@ -118,7 +257,8 @@ def pci_ids(dev: Path) -> tuple[str, str, str, str] | None:
         return None
 
 
-def discover(conf: dict[str, str], *, required: bool = True) -> Path | None:
+def discover(conf: dict, *, required: bool = True) -> Path | None:
+    """Find the R9700 by PCI identity."""
     want = (
         norm_hex(conf["VENDOR"]),
         norm_hex(conf["DEVICE"]),
@@ -146,6 +286,44 @@ def discover(conf: dict[str, str], *, required: bool = True) -> Path | None:
             die("multiple R9700 matches: " + " ".join(d.name for d in hits))
         return None
     return hits[0]
+
+
+def check_runtime_pm(pci: Path) -> None:
+    """Warn once per daemon start if power/control is not 'auto'."""
+    global _runtime_pm_warned
+    if _runtime_pm_warned:
+        return
+    try:
+        val = read_text(pci / "power" / "control")
+    except OSError:
+        return
+    if val != "auto":
+        log(
+            f"power/control={val}; runtime PM disabled by operator, "
+            "watcher will never see suspend",
+            syslog.LOG_WARNING,
+        )
+    _runtime_pm_warned = True
+
+
+def require_runtime_pm(pci: Path) -> None:
+    """Refuse to write if power/control is not 'auto'.
+
+    On an APU the display iGPU runs with control=on, so this guard is what
+    stops a mistyped identity from tuning the display GPU.
+    """
+    try:
+        val = read_text(pci / "power" / "control")
+    except OSError:
+        raise RuntimeError(
+            "power/control unreadable; this tool only writes to "
+            "runtime-PM-managed GPUs (control=auto); refusing"
+        )
+    if val != "auto":
+        raise RuntimeError(
+            f"power/control={val}; this tool only writes to "
+            "runtime-PM-managed GPUs (control=auto); refusing"
+        )
 
 
 def runtime_status(pci: Path) -> str:
@@ -260,9 +438,10 @@ def reset_od(pci: Path) -> None:
 
 
 def write_state(payload: str) -> None:
+    """Atomically write state file (best-effort; /run may be absent)."""
     try:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
-        (STATE_DIR / "state").write_text(payload, encoding="utf-8")
+        _atomic_write(STATE_DIR / "state", payload.encode("utf-8"))
     except OSError:
         pass
 
@@ -303,6 +482,12 @@ def od_attempts(pci: Path, fn, *, settle: bool = True):
 
 
 def maybe_scan_kernel_fatals() -> None:
+    """Scan kernel log for fatal GPU errors. Rate-limited to once per 60 s."""
+    global _last_kernel_scan
+    now = time.monotonic()
+    if now - _last_kernel_scan < 60.0:
+        return
+    _last_kernel_scan = now
     try:
         r = subprocess.run(
             ["journalctl", "-k", "--no-pager", "-n", "80", "-o", "cat"],
@@ -322,20 +507,26 @@ def maybe_scan_kernel_fatals() -> None:
         log("kernel warning: " + fatals[-1], syslog.LOG_WARNING)
 
 
-def restore_voltage(pci: Path, conf: dict[str, str]) -> str:
+def restore_voltage(pci: Path, conf: dict) -> str:
     """Read-before-write VO restore. One logical apply per call (with bounded retries)."""
-    want = int(conf["VOLTAGE_OFFSET_MV"])
+    # conf is validated: VOLTAGE_OFFSET_MV is already an int.
+    want = conf["VOLTAGE_OFFSET_MV"]
 
     def _read():
         return read_od(pci)
 
     od = od_attempts(pci, _read, settle=True)
-    if od["min_mv"] is not None and od["max_mv"] is not None:
-        if want < od["min_mv"] or want > od["max_mv"]:
-            raise RuntimeError(
-                f"VOLTAGE_OFFSET_MV={want} outside live range "
-                f"{od['min_mv']}..{od['max_mv']} mV"
-            )
+    # RDNA4/amdgpu: if the driver does not report the OD range we cannot
+    # safely write an offset — refuse rather than guess.
+    if od["min_mv"] is None or od["max_mv"] is None:
+        raise RuntimeError(
+            "OD_RANGE for VDDGFX_OFFSET not reported; refusing to write offset"
+        )
+    if want < od["min_mv"] or want > od["max_mv"]:
+        raise RuntimeError(
+            f"VOLTAGE_OFFSET_MV={want} outside live range "
+            f"{od['min_mv']}..{od['max_mv']} mV"
+        )
     if od["current_mv"] == want:
         return f"already {want}"
 
@@ -354,9 +545,10 @@ def restore_voltage(pci: Path, conf: dict[str, str]) -> str:
     return f"restored {got}"
 
 
-def maybe_restore_cap(pci: Path, conf: dict[str, str], *, force_log: bool) -> str:
+def maybe_restore_cap(pci: Path, conf: dict, *, force_log: bool) -> str:
     """Read cap; write only if it does not match config. Never on a guess."""
-    want = int(conf["POWER_LIMIT_W"])
+    # conf is validated: POWER_LIMIT_W is already an int.
+    want = conf["POWER_LIMIT_W"]
 
     def _read():
         return read_power_cap(pci)
@@ -384,7 +576,7 @@ def maybe_restore_cap(pci: Path, conf: dict[str, str], *, force_log: bool) -> st
     return f"applied {got:.0f}"
 
 
-def cmd_discover(conf: dict[str, str]) -> int:
+def cmd_discover(conf: dict) -> int:
     pci = discover(conf)
     assert pci is not None
     st = runtime_status(pci)
@@ -397,7 +589,7 @@ def cmd_discover(conf: dict[str, str]) -> int:
     return 0
 
 
-def cmd_status(conf: dict[str, str]) -> int:
+def cmd_status(conf: dict) -> int:
     pci = discover(conf)
     assert pci is not None
     st = runtime_status(pci)
@@ -429,24 +621,33 @@ def cmd_status(conf: dict[str, str]) -> int:
     return 0
 
 
-def apply_explicit(conf: dict[str, str], *, reason: str) -> str:
+def apply_explicit(conf: dict, *, reason: str) -> str:
     """Explicit apply: power cap then VO. Not used on ordinary BACO resume."""
     pci = discover(conf)
     assert pci is not None
     if not is_active(pci):
         return f"skip status={runtime_status(pci)}"
+    # Runtime-PM write guard: refuse before any sysfs write.
+    try:
+        require_runtime_pm(pci)
+    except RuntimeError as e:
+        try:
+            val = read_text(pci / "power" / "control")
+        except OSError:
+            val = "unreadable"
+        return f"skip control={val}"
     cap_s = maybe_restore_cap(pci, conf, force_log=True)
     vo_s = restore_voltage(pci, conf)
     if vo_s.startswith("restored"):
-        mv = int(conf["VOLTAGE_OFFSET_MV"])
+        mv = conf["VOLTAGE_OFFSET_MV"]
         log(f"VDDGFX offset applied: {mv} mV")
     elif vo_s.startswith("already"):
-        log(f"VDDGFX offset already {int(conf['VOLTAGE_OFFSET_MV'])} mV")
+        log(f"VDDGFX offset already {conf['VOLTAGE_OFFSET_MV']} mV")
     write_state(f"pci={pci.name}\nreason={reason}\n{cap_s}\n{vo_s}\nts={int(time.time())}\n")
     return f"ok {cap_s} {vo_s}"
 
 
-def cmd_apply(conf: dict[str, str]) -> int:
+def cmd_apply(conf: dict) -> int:
     try:
         pci = discover(conf)
         assert pci is not None
@@ -462,12 +663,18 @@ def cmd_apply(conf: dict[str, str]) -> int:
         return 1
 
 
-def cmd_reset(conf: dict[str, str]) -> int:
+def cmd_reset(conf: dict) -> int:
     pci = discover(conf)
     assert pci is not None
     if not is_active(pci):
         log(f"reset skipped: runtime_status={runtime_status(pci)}")
         return 0
+    # Runtime-PM write guard: refuse before any sysfs write.
+    try:
+        require_runtime_pm(pci)
+    except RuntimeError as e:
+        log(f"reset refused: {e}", syslog.LOG_ERR)
+        return 1
     try:
         cap = read_power_cap(pci)
         default_w = int(round(cap["default"] / 1_000_000))
@@ -485,6 +692,7 @@ def cmd_reset(conf: dict[str, str]) -> int:
 
 
 def set_conf_value(path: Path, key: str, value: str) -> None:
+    """Atomically update one key in the config file."""
     text = path.read_text(encoding="utf-8") if path.is_file() else ""
     pat = re.compile(rf"^{re.escape(key)}=.*$", re.M)
     line = f"{key}={value}"
@@ -494,10 +702,10 @@ def set_conf_value(path: Path, key: str, value: str) -> None:
         if text and not text.endswith("\n"):
             text += "\n"
         text += line + "\n"
-    path.write_text(text, encoding="utf-8")
+    _atomic_write(path, text.encode("utf-8"))
 
 
-def cmd_set_undervolt(conf: dict[str, str], mv: int) -> int:
+def cmd_set_undervolt(conf: dict, mv: int) -> int:
     if mv > 0:
         die("VDDGFX offset must be <= 0 mV")
     pci = discover(conf)
@@ -508,20 +716,39 @@ def cmd_set_undervolt(conf: dict[str, str], mv: int) -> int:
             die(f"{mv} mV below live min {od['min_mv']} mV")
         if od["max_mv"] is not None and mv > od["max_mv"]:
             die(f"{mv} mV above live max {od['max_mv']} mV")
+    # Runtime-PM write guard: die before touching the config file.
+    try:
+        require_runtime_pm(pci)
+    except RuntimeError as e:
+        die(str(e))
     set_conf_value(CONF_PATH, "VOLTAGE_OFFSET_MV", str(mv))
     log(f"config VOLTAGE_OFFSET_MV={mv}")
-    conf["VOLTAGE_OFFSET_MV"] = str(mv)
+    conf["VOLTAGE_OFFSET_MV"] = mv  # keep validated-dict type (int)
     return cmd_apply(conf)
 
 
-def handle_wake(pci: Path, conf: dict[str, str], cap_checked: bool) -> bool:
+def handle_wake(pci: Path, conf: dict, cap_checked: bool) -> bool:
     """Rising-edge handler. Returns new cap_checked flag.
 
     Exactly one VO restore attempt cycle per wake. Cap is written only if
     missing (startup verify, or readback proves loss after reset).
     """
+    global _runtime_pm_warned
     log("R9700 runtime active")
-    want = int(conf["VOLTAGE_OFFSET_MV"])
+    # conf is validated: VOLTAGE_OFFSET_MV is already an int.
+    want = conf["VOLTAGE_OFFSET_MV"]
+
+    # Runtime-PM write guard: refuse to write if control != auto.
+    try:
+        require_runtime_pm(pci)
+    except RuntimeError as e:
+        if not _runtime_pm_warned:
+            log(str(e), syslog.LOG_WARNING)
+            _runtime_pm_warned = True
+        # Do NOT call restore_voltage or the cap path.
+        write_state(f"pci={pci.name}\nstate=ACTIVE_CONFIGURED\nvo={want}\nts={int(time.time())}\n")
+        return cap_checked
+
     try:
         result = restore_voltage(pci, conf)
         if result.startswith("restored"):
@@ -552,7 +779,7 @@ def handle_wake(pci: Path, conf: dict[str, str], cap_checked: bool) -> bool:
     return cap_checked
 
 
-def cmd_watch(conf: dict[str, str]) -> int:
+def cmd_watch(conf: dict) -> int:
     global _stop
 
     def _handle(signum, frame):
@@ -562,53 +789,103 @@ def cmd_watch(conf: dict[str, str]) -> int:
     signal.signal(signal.SIGTERM, _handle)
     signal.signal(signal.SIGINT, _handle)
 
-    interval = float(conf.get("POLL_INTERVAL_S", "2"))
-    if interval < 1:
-        interval = 1.0
+    # conf is the validated dict from main (POLL_INTERVAL_S is a float).
+    interval = max(1.0, min(60.0, float(conf.get("POLL_INTERVAL_S", 2.0))))
 
     pci = discover(conf, required=False)
-    if pci is None:
-        log("R9700 not found yet; waiting", syslog.LOG_WARNING)
-    else:
+    if pci is not None:
+        check_runtime_pm(pci)
         log(f"R9700 discovered at {pci.name}")
+    else:
+        log("R9700 not found yet; waiting", syslog.LOG_WARNING)
 
     state = ST_SUSPENDED
     cap_checked = False
+    last_good = conf  # last successfully validated config
+    last_warn_text: str | None = None
+    last_unknown_warn: str | None = None
+    was_present = pci is not None
+
     # Initial edge: if already active, treat as unconfigured (boot / daemon start).
     if pci is not None and is_active(pci):
         state = ST_ACTIVE_UNCONFIGURED
-        conf = load_conf()
-        cap_checked = handle_wake(pci, conf, cap_checked)
+        cap_checked = handle_wake(pci, last_good, cap_checked)
         state = ST_ACTIVE_CONFIGURED
     elif pci is not None:
         state = ST_SUSPENDED
 
     while not _stop:
-        conf = load_conf()  # cheap; picks up edits. discovery IDs from conf.
-        pci = discover(conf, required=False)
-        if pci is None:
-            time.sleep(interval)
-            continue
-        st = runtime_status(pci)
-        if state == ST_SUSPENDED and st == "active":
-            state = ST_ACTIVE_UNCONFIGURED
-            conf = load_conf()
-            cap_checked = handle_wake(pci, conf, cap_checked)
-            # One attempt per wake, success or fail.
-            state = ST_ACTIVE_CONFIGURED
-        elif state != ST_SUSPENDED and st != "active":
-            log("R9700 runtime suspended")
-            state = ST_SUSPENDED
-            write_state(f"pci={pci.name}\nstate=SUSPENDED\nts={int(time.time())}\n")
+        try:
+            # Reload config with validation (explicit CONF_PATH to avoid
+            # stale default-arg binding).
+            raw = load_conf(CONF_PATH)
+            parsed, problems = validate_conf(raw)
+            fatal = [p for p in problems if not p.startswith("unknown key")]
+            if fatal:
+                warn_text = "; ".join(problems)
+                if warn_text != last_warn_text:
+                    log(
+                        f"config reload failed, keeping last good: {warn_text}",
+                        syslog.LOG_WARNING,
+                    )
+                    last_warn_text = warn_text
+                # keep using last_good
+            else:
+                if last_warn_text is not None:
+                    log("config OK again")
+                    last_warn_text = None
+                if problems:
+                    unknown_text = "; ".join(problems)
+                    if unknown_text != last_unknown_warn:
+                        log(unknown_text, syslog.LOG_WARNING)
+                        last_unknown_warn = unknown_text
+                else:
+                    last_unknown_warn = None
+                last_good = parsed
+
+            conf_now = last_good
+            interval = max(1.0, min(60.0, float(conf_now.get("POLL_INTERVAL_S", 2.0))))
+
+            pci = discover(conf_now, required=False)
+            if pci is None:
+                # Device gone: reset state so next appearance is a wake.
+                if was_present:
+                    log("R9700 not present", syslog.LOG_WARNING)
+                    was_present = False
+                state = ST_SUSPENDED
+                time.sleep(interval)
+                continue
+
+            if not was_present:
+                log(f"R9700 discovered at {pci.name}")
+                was_present = True
+
+            st = runtime_status(pci)
+            # Only "active" is a rising edge; only "suspended" is a falling edge.
+            # "unreadable:...", "suspending", "resuming" are NOT transitions.
+            if st == "active":
+                if state == ST_SUSPENDED:
+                    state = ST_ACTIVE_UNCONFIGURED
+                    cap_checked = handle_wake(pci, conf_now, cap_checked)
+                    state = ST_ACTIVE_CONFIGURED
+            elif st == "suspended":
+                if state != ST_SUSPENDED:
+                    log("R9700 runtime suspended")
+                    state = ST_SUSPENDED
+                    write_state(f"pci={pci.name}\nstate=SUSPENDED\nts={int(time.time())}\n")
+            # else: transitional/unreadable — just sleep and poll again
+        except Exception as e:
+            log(f"watcher loop error: {e}", syslog.LOG_WARNING)
         time.sleep(interval)
+
     log("watcher stopping")
     return 0
 
 
-def cmd_probe_poll(conf: dict[str, str], seconds: int = 30) -> int:
+def cmd_probe_poll(conf: dict, seconds: int = 30) -> int:
     pci = discover(conf)
     assert pci is not None
-    interval = float(conf.get("POLL_INTERVAL_S", "2"))
+    interval = max(1.0, min(60.0, float(conf.get("POLL_INTERVAL_S", 2.0))))
     log(f"R9700 discovered at {pci.name}")
     log(f"probe-poll: reading runtime_status every {interval:.0f}s for {seconds}s")
     t0 = time.time()
@@ -649,7 +926,16 @@ def main(argv: list[str] | None = None) -> int:
     conf_path = Path(args.config)
     global CONF_PATH
     CONF_PATH = conf_path
-    conf = load_conf(conf_path)
+    raw_conf = load_conf(conf_path)
+
+    # Typed validation: fatal problems abort; unknown keys only warn.
+    conf, problems = validate_conf(raw_conf)
+    fatal = [p for p in problems if not p.startswith("unknown key")]
+    if fatal:
+        die("; ".join(problems))
+    if problems:
+        log("; ".join(problems), syslog.LOG_WARNING)
+
     if args.cmd == "discover":
         return cmd_discover(conf)
     if args.cmd == "status":
