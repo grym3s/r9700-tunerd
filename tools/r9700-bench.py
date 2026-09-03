@@ -33,6 +33,13 @@ PROMPTS = [
     "Write a C program implementing a lock-free SPSC ring buffer using C11 atomics. Handle the wrap-around case correctly.",
 ]
 
+# Warm-up prompt: intentionally trivial so JIT load is the only cost.
+WARMUP_PROMPT = "Say hello."
+WARMUP_MAX_TOKENS = 32
+
+# Seconds of sampling excluded from aggregates (ramp window).
+RAMP_S = 3.0
+
 CSV_FIELDS = [
     "ts", "runtime_status", "power_state", "runtime_suspended_time_ms",
     "power_w", "edge_c", "junction_c", "mem_c", "fan_rpm",
@@ -172,6 +179,34 @@ def parse_od_offset(text: str) -> int | None:
             if m:
                 return int(m.group(1))
     return None
+
+
+# ─── Baseline reader ─────────────────────────────────────────────────────────
+
+def read_baseline(gpu: GpuSysfs, timeout: float = 3.0) -> tuple[int | None, float | None]:
+    """Read VDDGFX offset and power cap from sysfs, retrying until the device
+    is active and both values are readable, or *timeout* seconds elapse.
+
+    Called after warm-up so the watcher has had time to restore the offset
+    following a D3cold wake.
+    """
+    deadline = time.monotonic() + timeout
+    offset: int | None = None
+    cap: float | None = None
+    while time.monotonic() < deadline:
+        if gpu.runtime_status() == "active":
+            if offset is None:
+                od = gpu.read_active("pp_od_clk_voltage")
+                if od:
+                    offset = parse_od_offset(od)
+            if cap is None:
+                cap_raw = gpu.read_hwmon("power1_cap")
+                if cap_raw is not None:
+                    cap = int(cap_raw) / 1_000_000.0
+            if offset is not None and cap is not None:
+                break
+        time.sleep(0.5)
+    return offset, cap
 
 
 # ─── Sampler ─────────────────────────────────────────────────────────────────
@@ -411,23 +446,32 @@ def cmd_run(args):
     if os.geteuid() == 0:
         print("warning: running as root; all reads are world-readable", file=sys.stderr)
 
-    # ── Pre-run state ──
+    # ── Warm-up: load model into VRAM, let watcher restore offset ──
+    warmup_s: float | None = None
+    if not args.no_warmup:
+        t0 = time.monotonic()
+        send_chat_request(args.endpoint, args.model, WARMUP_PROMPT,
+                          max_tokens=WARMUP_MAX_TOKENS)
+        warmup_s = round(time.monotonic() - t0, 3)
+        # Settle: model resident + watcher offset restore (~2 s) + margin.
+        time.sleep(3.0)
+
+    # ── Baseline: read offset/cap from sysfs (retry up to 3 s) ──
+    baseline_offset, baseline_cap = read_baseline(gpu, timeout=3.0)
+    baseline_source = "sysfs (post-warmup)"
+    if baseline_offset is None and baseline_cap is None:
+        baseline_source = "unavailable (timeout)"
+
+    # ── Pre-run metadata ──
     pre = {
         "kernel": Path("/proc/sys/kernel/osrelease").read_text().strip(),
         "amdgpu_version": None,
-        "vddgfx_offset_mv": None,
-        "power_cap_w": None,
+        "vddgfx_offset_mv": baseline_offset,
+        "power_cap_w": baseline_cap,
     }
     amdgpu_ver = Path("/sys/module/amdgpu/version")
     if amdgpu_ver.exists():
         pre["amdgpu_version"] = amdgpu_ver.read_text().strip()
-    # Live tuning (may be null if GPU is suspended at start)
-    od = gpu.read_active("pp_od_clk_voltage")
-    if od:
-        pre["vddgfx_offset_mv"] = parse_od_offset(od)
-    cap = gpu.read_hwmon("power1_cap")
-    if cap is not None:
-        pre["power_cap_w"] = int(cap) / 1_000_000.0  # µW → W
 
     # ── Output paths ──
     out_dir = Path(args.out).expanduser()
@@ -442,10 +486,11 @@ def cmd_run(args):
     csv_writer = csv.DictWriter(csv_file, fieldnames=CSV_FIELDS, extrasaction="ignore")
     csv_writer.writeheader()
     csv_file.flush()
+    sampler_start_ts = time.time()  # reference for ramp window
     sampler = Sampler(gpu, interval=args.interval, csv_writer=csv_writer, csv_file=csv_file)
     sampler.start()
 
-    # ── Send requests ──
+    # ── Send measured requests ──
     n = min(args.prompts, len(PROMPTS))
     results = []
     for i in range(n):
@@ -469,22 +514,12 @@ def cmd_run(args):
     sampler.stop()
     csv_file.close()
 
-    # ── Fallback: if pre-run read returned None (card was suspended at
-    #    start), use the first active sampler row as the tuning baseline. ──
-    baseline_source = "pre-run"
-    if pre["vddgfx_offset_mv"] is None or pre["power_cap_w"] is None:
-        first_active = next(
-            (row for row in sampler.rows if row.get("runtime_status") == "active"),
-            None,
-        )
-        if first_active is not None:
-            if pre["vddgfx_offset_mv"] is None and "vddgfx_offset_mv" in first_active:
-                pre["vddgfx_offset_mv"] = first_active["vddgfx_offset_mv"]
-            if pre["power_cap_w"] is None and "power_cap_w" in first_active:
-                pre["power_cap_w"] = first_active["power_cap_w"]
-            baseline_source = "first active sample"
+    # ── Split active rows into ramp (first RAMP_S) and steady-state ──
+    active_rows = [row for row in sampler.rows if row.get("runtime_status") == "active"]
+    ramp_rows = [row for row in active_rows if row["ts"] - sampler_start_ts < RAMP_S]
+    steady_rows = [row for row in active_rows if row["ts"] - sampler_start_ts >= RAMP_S]
 
-    # ── Aggregates ──
+    # ── Aggregates (steady-state only) ──
     ok = [r for r in results if not r["error"]]
     errors = [r for r in results if r["error"]]
     gen_list = [r["gen_tok_s"] for r in ok if r.get("gen_tok_s") is not None]
@@ -498,29 +533,60 @@ def cmd_run(args):
     total_accepted = sum(r.get("accepted_tokens", 0) for r in ok)
     draft_acceptance = (total_accepted / total_draft) if total_draft > 0 else None
 
-    active_rows = [row for row in sampler.rows if row.get("runtime_status") == "active"]
-    powers = [row["power_w"] for row in active_rows if "power_w" in row]
-    junctions = [row["junction_c"] for row in active_rows if "junction_c" in row]
-    sclk_vals = [row["sclk_mhz"] for row in active_rows if "sclk_mhz" in row]
+    # Steady-state sensor aggregates
+    powers = [row["power_w"] for row in steady_rows if "power_w" in row]
+    junctions = [row["junction_c"] for row in steady_rows if "junction_c" in row]
+    sclk_vals = [row["sclk_mhz"] for row in steady_rows if "sclk_mhz" in row]
 
-    # Offset / cap stability
+    # ── Ramp aggregates (first RAMP_S of sampling) ──
+    ramp_powers = [row["power_w"] for row in ramp_rows if "power_w" in row]
+    ramp_junctions = [row["junction_c"] for row in ramp_rows if "junction_c" in row]
+    ramp_sclk = [row["sclk_mhz"] for row in ramp_rows if "sclk_mhz" in row]
+    ramp = {
+        "n_samples": len(ramp_rows),
+        "mean_power_w": round(mean(ramp_powers), 2) if ramp_powers else None,
+        "max_power_w": round(max(ramp_powers), 2) if ramp_powers else None,
+        "max_junction_c": round(max(ramp_junctions), 1) if ramp_junctions else None,
+        "min_sclk_mhz": min(ramp_sclk) if ramp_sclk else None,
+        "max_sclk_mhz": max(ramp_sclk) if ramp_sclk else None,
+    }
+
+    # ── Stability check (steady-state samples vs baseline) ──
     offset_stable = True
     cap_stable = True
-    if pre["vddgfx_offset_mv"] is not None:
-        offsets = [row["vddgfx_offset_mv"] for row in active_rows if "vddgfx_offset_mv" in row]
-        if offsets:
-            offset_stable = all(o == pre["vddgfx_offset_mv"] for o in offsets)
-    if pre["power_cap_w"] is not None:
-        caps = [row["power_cap_w"] for row in active_rows if "power_cap_w" in row]
-        if caps:
-            cap_stable = all(abs(c - pre["power_cap_w"]) < 0.1 for c in caps)
+    offset_mismatch_count = 0
+    offset_mismatch_first_s: float | None = None
+    offset_mismatch_last_s: float | None = None
+    cap_mismatch_count = 0
+    cap_mismatch_first_s: float | None = None
+    cap_mismatch_last_s: float | None = None
 
-    # Energy (trapezoidal integration over consecutive ACTIVE rows;
-    # skip pairs whose gap exceeds 3× interval — a suspend/resume boundary)
+    if baseline_offset is not None:
+        for row in steady_rows:
+            if "vddgfx_offset_mv" in row and row["vddgfx_offset_mv"] != baseline_offset:
+                offset_mismatch_count += 1
+                dt = round(row["ts"] - sampler_start_ts, 3)
+                if offset_mismatch_first_s is None:
+                    offset_mismatch_first_s = dt
+                offset_mismatch_last_s = dt
+        offset_stable = (offset_mismatch_count == 0)
+
+    if baseline_cap is not None:
+        for row in steady_rows:
+            if "power_cap_w" in row and abs(row["power_cap_w"] - baseline_cap) >= 0.1:
+                cap_mismatch_count += 1
+                dt = round(row["ts"] - sampler_start_ts, 3)
+                if cap_mismatch_first_s is None:
+                    cap_mismatch_first_s = dt
+                cap_mismatch_last_s = dt
+        cap_stable = (cap_mismatch_count == 0)
+
+    # ── Energy (trapezoidal integration over consecutive steady-state rows;
+    #    skip pairs whose gap exceeds 3× interval — a suspend/resume boundary) ──
     energy_j = 0.0
-    for i in range(1, len(active_rows)):
-        prev = active_rows[i - 1]
-        curr = active_rows[i]
+    for i in range(1, len(steady_rows)):
+        prev = steady_rows[i - 1]
+        curr = steady_rows[i]
         if "power_w" not in prev or "power_w" not in curr:
             continue
         dt = curr["ts"] - prev["ts"]
@@ -537,6 +603,7 @@ def cmd_run(args):
         "label": label,
         "endpoint": args.endpoint,
         "model": args.model,
+        "warmup_s": warmup_s,
         "pre_run": pre,
         "baseline_source": baseline_source,
         "requests": results,
@@ -556,11 +623,18 @@ def cmd_run(args):
             "max_sclk_mhz": max(sclk_vals) if sclk_vals else None,
             "offset_stable": offset_stable,
             "cap_stable": cap_stable,
+            "offset_mismatch_count": offset_mismatch_count,
+            "offset_mismatch_first_s": offset_mismatch_first_s,
+            "offset_mismatch_last_s": offset_mismatch_last_s,
+            "cap_mismatch_count": cap_mismatch_count,
+            "cap_mismatch_first_s": cap_mismatch_first_s,
+            "cap_mismatch_last_s": cap_mismatch_last_s,
             "energy_j": round(energy_j, 1),
             "draft_acceptance": round(draft_acceptance, 4) if draft_acceptance is not None else None,
             "draft_tokens_total": total_draft,
             "accepted_tokens_total": total_accepted,
         },
+        "ramp": ramp,
         "errors": [r["error"] for r in errors],
         "d3cold_s": round(d3cold_s, 2) if d3cold_s is not None else None,
         "n_samples": len(sampler.rows),
@@ -573,8 +647,18 @@ def cmd_run(args):
     print(f"  R9700 bench  {label}  {ts_str}")
     print(f"{'='*60}")
     print(f"  Model:          {args.model}")
+    if warmup_s is not None:
+        print(f"  Warm-up:        {warmup_s} s")
+    else:
+        print(f"  Warm-up:        skipped (--no-warmup)")
     print(f"  Offset:         {pre['vddgfx_offset_mv']} mV  (stable: {offset_stable}, source: {baseline_source})")
     print(f"  Cap:            {pre['power_cap_w']} W   (stable: {cap_stable}, source: {baseline_source})")
+    if offset_mismatch_count > 0:
+        print(f"  Offset drift:   {offset_mismatch_count} sample(s)  "
+              f"first={offset_mismatch_first_s}s  last={offset_mismatch_last_s}s")
+    if cap_mismatch_count > 0:
+        print(f"  Cap drift:      {cap_mismatch_count} sample(s)  "
+              f"first={cap_mismatch_first_s}s  last={cap_mismatch_last_s}s")
     print(f"  Gen tok/s:      mean={a['mean_gen_tok_s']}  median={a['median_gen_tok_s']}")
     print(f"  Prompt tok/s:   mean={a['mean_prompt_tok_s']}")
     print(f"  Agg tok/s:      {a['agg_tok_s']}  ({total_comp} tok / {a['total_wall_s']} s)")
@@ -582,6 +666,10 @@ def cmd_run(args):
     print(f"  Efficiency:     {a['tok_s_per_w']} tok/s/W  {a['tok_per_joule']} tok/J")
     print(f"  Max junction:   {a['max_junction_c']} °C")
     print(f"  SCLK range:     {a['min_sclk_mhz']}–{a['max_sclk_mhz']} MHz")
+    if ramp["n_samples"] > 0:
+        print(f"  Ramp ({RAMP_S:.0f}s):     n={ramp['n_samples']}  "
+              f"mean_P={ramp['mean_power_w']} W  max_jc={ramp['max_junction_c']} °C  "
+              f"SCLK={ramp['min_sclk_mhz']}–{ramp['max_sclk_mhz']} MHz")
     if total_draft > 0:
         print(f"  Draft accept:   {a['draft_acceptance']:.3f}  ({total_accepted}/{total_draft})")
     else:
@@ -621,7 +709,7 @@ def cmd_compare(args):
 
     hdr = (f"{'label':<22} {'off_mV':>7} {'cap_W':>6} {'gen_t/s':>8} "
            f"{'agg_t/s':>8} {'mean_W':>7} {'t/s/W':>7} {'max_jc':>7} "
-           f"{'err':>4} {'d3c_s':>6}")
+           f"{'warm_s':>7} {'stable':>6} {'err':>4} {'d3c_s':>6}")
     print(hdr)
     print("─" * len(hdr))
     for r in rows:
@@ -629,6 +717,11 @@ def cmd_compare(args):
         pre = r.get("pre_run", {})
         off = pre.get("vddgfx_offset_mv")
         cap = pre.get("power_cap_w")
+        warm = r.get("warmup_s")
+        # stable = Y if both offset and cap are stable (or unavailable)
+        o_stable = agg.get("offset_stable", True)
+        c_stable = agg.get("cap_stable", True)
+        stable_str = "Y" if (o_stable and c_stable) else "N"
         print(
             f"{r.get('label', '?'):<22} "
             f"{_fmt(off, 'd'):>7} "
@@ -638,6 +731,8 @@ def cmd_compare(args):
             f"{_fmt(agg.get('mean_power_w'), '.1f'):>7} "
             f"{_fmt(agg.get('tok_s_per_w'), '.2f'):>7} "
             f"{_fmt(agg.get('max_junction_c'), '.1f'):>7} "
+            f"{_fmt(warm, '.1f'):>7} "
+            f"{stable_str:>6} "
             f"{len(r.get('errors', [])):>4} "
             f"{_fmt(r.get('d3cold_s'), '.1f'):>6}"
         )
@@ -673,6 +768,8 @@ def main():
     rp.add_argument("--label", default=None, help="label for output files")
     rp.add_argument("--out", default="~/r9700-bench", help="output directory")
     rp.add_argument("--interval", type=float, default=1.0, help="seconds between samples")
+    rp.add_argument("--no-warmup", action="store_true",
+                    help="skip warm-up request and 3 s settle (model already resident)")
     rp.set_defaults(func=cmd_run)
 
     # compare
