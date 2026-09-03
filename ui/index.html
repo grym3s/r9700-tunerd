@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>R9700 Tuner</title>
+<style>
+:root{
+  --bg:#0b0d10;--panel:#12161b;--panel2:#171c22;--line:#232a33;--text:#e6ebf0;--muted:#8a96a3;
+  --accent:#ff5c1a;--accent2:#ffb02e;--ok:#3ddc84;--warn:#ffb02e;--bad:#ff4d4f;--sleep:#5aa9ff;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;--sans:Inter,system-ui,Segoe UI,Roboto,sans-serif;
+}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14px}
+a{color:var(--accent2)}
+.wrap{max-width:1240px;margin:0 auto;padding:20px}
+header{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:14px 18px;border:1px solid var(--line);border-radius:14px;background:linear-gradient(135deg,#151a20,#0f1317)}
+.brand{display:flex;align-items:center;gap:14px}
+.brand .logo{width:42px;height:42px;border-radius:10px;background:radial-gradient(circle at 30% 30%,#ff8a3d,#c2380a);box-shadow:0 0 24px rgba(255,92,26,.35)}
+.brand h1{font-size:18px;margin:0;letter-spacing:.3px}
+.brand small{display:block;color:var(--muted);font-weight:400}
+.pill{display:inline-flex;align-items:center;gap:8px;padding:8px 14px;border-radius:999px;border:1px solid var(--line);background:var(--panel2);font-weight:600;font-family:var(--mono);font-size:13px}
+.pill .dot{width:10px;height:10px;border-radius:50%;background:var(--muted);box-shadow:0 0 0 0 transparent}
+.pill.sleep .dot{background:var(--sleep);box-shadow:0 0 12px var(--sleep)}
+.pill.active .dot{background:var(--accent);box-shadow:0 0 12px var(--accent)}
+.pill.err .dot{background:var(--bad)}
+.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:16px;margin-top:16px}
+.card{grid-column:span 4;background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:16px;min-height:120px}
+.card.wide{grid-column:span 8}.card.full{grid-column:span 12}
+.card h2{margin:0 0 10px;font-size:12px;letter-spacing:1.4px;text-transform:uppercase;color:var(--muted);font-weight:600}
+.big{font-size:34px;font-weight:700;font-family:var(--mono);letter-spacing:-.5px}
+.big small{font-size:14px;color:var(--muted);font-weight:500;margin-left:6px}
+.row{display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:6px 14px;font-family:var(--mono);font-size:13px}
+.kv span:nth-child(odd){color:var(--muted)}
+.bar{position:relative;height:10px;background:#0a0d11;border:1px solid var(--line);border-radius:6px;overflow:hidden;margin-top:10px}
+.bar i{position:absolute;left:0;top:0;bottom:0;background:linear-gradient(90deg,var(--accent2),var(--accent));border-radius:6px;transition:width .4s}
+.bar b{position:absolute;top:-2px;bottom:-2px;width:2px;background:#fff;opacity:.8}
+canvas{width:100%;height:120px;display:block;background:#0a0d11;border:1px solid var(--line);border-radius:10px}
+.slider{margin:12px 0 4px}
+.slider label{display:flex;justify-content:space-between;font-family:var(--mono);font-size:13px;color:var(--muted);margin-bottom:6px}
+.slider label output{color:var(--text);font-weight:700;font-size:15px}
+input[type=range]{width:100%;accent-color:var(--accent);height:26px}
+.range-note{font-size:12px;color:var(--muted);font-family:var(--mono)}
+.btns{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}
+button{background:var(--panel2);color:var(--text);border:1px solid var(--line);border-radius:10px;padding:10px 14px;font-weight:600;cursor:pointer;transition:transform .05s,border-color .2s}
+button:hover{border-color:var(--accent)}button:active{transform:translateY(1px)}
+button.primary{background:linear-gradient(135deg,var(--accent),#c2380a);border-color:transparent}
+button.danger{border-color:#5a2222}button.danger:hover{border-color:var(--bad)}
+button:disabled{opacity:.45;cursor:not-allowed}
+.profiles{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+.profile{border:1px solid var(--line);border-radius:12px;padding:12px;cursor:pointer;background:var(--panel2);text-align:left}
+.profile:hover{border-color:var(--accent)}
+.profile.current{border-color:var(--ok);box-shadow:inset 0 0 0 1px var(--ok)}
+.profile .name{font-weight:700}
+.profile .vals{font-family:var(--mono);color:var(--muted);font-size:12px;margin-top:4px}
+.profile .tag{float:right;font-size:10px;letter-spacing:1px;color:var(--muted)}
+table{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:12.5px}
+th,td{padding:8px 8px;border-bottom:1px solid var(--line);text-align:right;white-space:nowrap}
+th:first-child,td:first-child{text-align:left}
+th{color:var(--muted);font-weight:600;letter-spacing:.5px}
+tr.best td{color:var(--ok)}
+pre.log{margin:0;font-family:var(--mono);font-size:12px;color:#b9c4cf;background:#0a0d11;border:1px solid var(--line);border-radius:10px;padding:12px;max-height:260px;overflow:auto;white-space:pre-wrap}
+.toast{position:fixed;right:20px;bottom:20px;background:var(--panel2);border:1px solid var(--line);border-left:4px solid var(--accent);padding:12px 16px;border-radius:10px;max-width:420px;font-family:var(--mono);font-size:12.5px;display:none;z-index:9}
+.toast.ok{border-left-color:var(--ok)}.toast.bad{border-left-color:var(--bad)}
+.muted{color:var(--muted)}
+.foot{margin-top:18px;color:var(--muted);font-size:12px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px}
+@media (max-width:900px){.card,.card.wide{grid-column:span 12}.profiles{grid-template-columns:repeat(2,1fr)}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="brand"><div class="logo"></div>
+      <div><h1>Radeon AI PRO R9700 <small id="pci">discovering…</small></h1></div>
+    </div>
+    <div style="display:flex;gap:10px;align-items:center">
+      <span class="pill" id="svc"><span class="dot"></span><span>watcher</span></span>
+      <span class="pill" id="state"><span class="dot"></span><span>connecting…</span></span>
+    </div>
+  </header>
+
+  <div class="grid">
+    <div class="card">
+      <h2>Power</h2>
+      <div class="big"><span id="pw">—</span><small>W</small></div>
+      <div class="bar"><i id="pwbar" style="width:0%"></i><b id="capmark" style="left:0%"></b></div>
+      <div class="kv" style="margin-top:10px"><span>cap</span><span id="cap">—</span><span>range</span><span id="caprange">—</span></div>
+    </div>
+    <div class="card">
+      <h2>Thermals</h2>
+      <div class="big"><span id="tj">—</span><small>°C junction</small></div>
+      <div class="kv" style="margin-top:10px"><span>edge</span><span id="te">—</span><span>memory</span><span id="tm">—</span><span>fan</span><span id="fan">—</span></div>
+    </div>
+    <div class="card">
+      <h2>Clocks &amp; voltage</h2>
+      <div class="big"><span id="sclk">—</span><small>MHz</small></div>
+      <div class="kv" style="margin-top:10px"><span>mclk</span><span id="mclk">—</span><span>busy</span><span id="busy">—</span><span>VDDGFX offset</span><span id="vo">—</span></div>
+    </div>
+
+    <div class="card wide">
+      <h2>Live trace <span class="muted" id="tracehint">(samples only while the card is awake)</span></h2>
+      <canvas id="trace" width="1200" height="240"></canvas>
+    </div>
+    <div class="card">
+      <h2>Runtime PM</h2>
+      <div class="kv">
+        <span>status</span><span id="rts">—</span>
+        <span>power_state</span><span id="pst">—</span>
+        <span>control</span><span id="ctl">—</span>
+        <span>suspended</span><span id="susp">—</span>
+        <span>tuned to</span><span id="tuned">—</span>
+        <span>ranges from</span><span id="rsrc">—</span>
+      </div>
+    </div>
+
+    <div class="card wide">
+      <h2>Tune</h2>
+      <div class="slider">
+        <label><span>VDDGFX offset</span><output id="voOut">-25 mV</output></label>
+        <input type="range" id="voSlider" min="-200" max="0" step="5" value="-25">
+        <div class="range-note" id="voNote">range: live values not yet known</div>
+      </div>
+      <div class="slider">
+        <label><span>Power cap</span><output id="capOut">210 W</output></label>
+        <input type="range" id="capSlider" min="210" max="330" step="5" value="210">
+        <div class="range-note" id="capNote">range: live values not yet known</div>
+      </div>
+      <div class="btns">
+        <button class="primary" id="applyBtn">Apply</button>
+        <button id="reapplyBtn" title="Re-run the daemon's apply (idempotent)">Re-apply config</button>
+        <button id="benchBtn">Benchmark this setting</button>
+        <button class="danger" id="resetBtn" title="Restore AMD defaults (cap default, OD reset)">Restore AMD defaults</button>
+      </div>
+      <div class="muted" style="margin-top:8px;font-size:12px">Values are validated by the daemon against the live range when the card is awake, or the cached range from its last wake. Nothing here can hold the card out of D3cold.</div>
+    </div>
+    <div class="card">
+      <h2>Profiles</h2>
+      <div class="profiles" id="profiles"></div>
+    </div>
+
+    <div class="card full">
+      <h2>Benchmarks <span class="muted" id="benchstate"></span></h2>
+      <table id="bench"><thead><tr>
+        <th>label</th><th>offset</th><th>cap</th><th>gen tok/s</th><th>agg tok/s</th><th>mean W</th><th>tok/s/W</th><th>max Tj</th><th>stable</th><th>err</th><th>D3cold s</th><th>when</th>
+      </tr></thead><tbody></tbody></table>
+      <pre class="log" id="benchlog" style="margin-top:10px;display:none"></pre>
+    </div>
+
+    <div class="card full">
+      <h2>Watcher journal</h2>
+      <pre class="log" id="journal">—</pre>
+    </div>
+  </div>
+  <div class="foot"><span>r9700-tunerd · runtime-PM-aware · sysfs only · never opens /dev/dri</span><span id="clock"></span></div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+(() => {
+  const q = new URLSearchParams(location.search);
+  const TOKEN = q.get('t') || localStorage.getItem('r9700_token') || '';
+  if (q.get('t')) { try { localStorage.setItem('r9700_token', q.get('t')); } catch(e){} }
+  const $ = id => document.getElementById(id);
+  const fmt = (v, d=0) => (v === null || v === undefined || Number.isNaN(v)) ? '—' : Number(v).toFixed(d);
+  const api = async (path, opts={}) => {
+    const url = path + (path.includes('?') ? '&' : '?') + 't=' + encodeURIComponent(TOKEN);
+    const r = await fetch(url, Object.assign({headers: {'X-Token': TOKEN, 'Content-Type': 'application/json'}}, opts));
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.error || (r.status + ' ' + r.statusText));
+    return j;
+  };
+  const toast = (msg, cls='') => { const t=$('toast'); t.textContent=msg; t.className='toast '+cls; t.style.display='block'; clearTimeout(t._h); t._h=setTimeout(()=>t.style.display='none', 6000); };
+
+  // ---- live trace (power, junction) ----
+  const hist = []; const MAXH = 240;
+  const canvas = $('trace'); const ctx = canvas.getContext('2d');
+  function draw() {
+    const W = canvas.width, H = canvas.height; ctx.clearRect(0,0,W,H);
+    ctx.fillStyle = '#0a0d11'; ctx.fillRect(0,0,W,H);
+    ctx.strokeStyle = '#1c232c'; ctx.lineWidth = 1;
+    for (let y=0; y<=4; y++){ ctx.beginPath(); ctx.moveTo(0, y*H/4); ctx.lineTo(W, y*H/4); ctx.stroke(); }
+    if (!hist.length) { ctx.fillStyle='#4a5563'; ctx.font='13px ui-monospace,monospace'; ctx.fillText('no samples yet — the card is asleep or the server just started', 16, H/2); return; }
+    const cap = Math.max(...hist.map(h => h.cap || 330), 330);
+    const line = (key, max, color) => {
+      ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.beginPath();
+      hist.forEach((h, i) => { const x = i * (W/(MAXH-1)); const v = h[key]; if (v === null || v === undefined) return;
+        const y = H - (v/max)*H*0.92 - 6; if (i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y); });
+      ctx.stroke();
+    };
+    line('power', cap, '#ff5c1a'); line('tj', 110, '#5aa9ff');
+    ctx.fillStyle='#ff5c1a'; ctx.font='12px ui-monospace,monospace'; ctx.fillText('power W (0–'+cap+')', 12, 16);
+    ctx.fillStyle='#5aa9ff'; ctx.fillText('junction °C (0–110)', 150, 16);
+    // sleep markers
+    ctx.fillStyle='rgba(90,169,255,.12)';
+    hist.forEach((h,i)=>{ if (h.sleep) ctx.fillRect(i*(W/(MAXH-1)), 0, W/(MAXH-1)+1, H); });
+  }
+
+  // ---- state rendering ----
+  let ranges = null, tuned = null, profiles = [];
+  function setPill(el, cls, text){ el.className = 'pill ' + cls; el.querySelector('span:last-child').textContent = text; }
+  function applyRanges(r){
+    if (!r || r.vo_min_mv === null || r.vo_min_mv === undefined) return;
+    ranges = r;
+    $('voSlider').min = r.vo_min_mv; $('voSlider').max = r.vo_max_mv;
+    $('capSlider').min = r.cap_min_w; $('capSlider').max = r.cap_max_w;
+    $('voNote').textContent = `range ${r.vo_min_mv}…${r.vo_max_mv} mV (${r.source}${r.age_s!=null?', '+Math.round(r.age_s)+' s old':''})`;
+    $('capNote').textContent = `range ${r.cap_min_w}…${r.cap_max_w} W, AMD default ${r.cap_default_w} W (${r.source})`;
+    $('caprange').textContent = `${r.cap_min_w}–${r.cap_max_w} W`;
+    $('rsrc').textContent = r.source + (r.age_s!=null ? ` (${Math.round(r.age_s)} s)` : '');
+    const cap = Number($('capSlider').value); const pct = (cap - r.cap_min_w)/(r.cap_max_w - r.cap_min_w)*100; $('capmark').style.left = Math.max(0,Math.min(100,pct))+'%';
+  }
+  function render(s){
+    $('pci').textContent = s.pci || '—';
+    $('clock').textContent = new Date().toLocaleTimeString();
+    const active = s.runtime_status === 'active';
+    setPill($('state'), active ? 'active' : 'sleep', active ? 'ACTIVE' + (s.live && s.live.offset_mv===s.tuned.offset_mv ? ' · tuned' : ' · restoring…') : (s.power_state || 'suspended').toUpperCase() + ' · sleeping');
+    const svc = s.service || {}; setPill($('svc'), svc.active ? 'active' : 'err', svc.active ? `watcher pid ${svc.pid||''}` : 'watcher DOWN');
+    $('rts').textContent = s.runtime_status; $('pst').textContent = s.power_state; $('ctl').textContent = s.control;
+    $('susp').textContent = s.suspended_ms != null ? (s.suspended_ms/1000).toFixed(0)+' s total' : '—';
+    tuned = s.tuned || tuned; if (tuned) $('tuned').textContent = `${tuned.offset_mv} mV / ${tuned.cap_w} W`;
+    applyRanges(s.ranges);
+    const l = s.live;
+    if (active && l) {
+      $('pw').textContent = fmt(l.power_w,0); $('cap').textContent = fmt(l.cap_w,0)+' W';
+      const pct = l.cap_w ? Math.min(100, (l.power_w||0)/l.cap_w*100) : 0; $('pwbar').style.width = pct+'%';
+      $('tj').textContent = fmt(l.junction_c,0); $('te').textContent = fmt(l.edge_c,0)+' °C'; $('tm').textContent = fmt(l.mem_c,0)+' °C';
+      $('fan').textContent = l.fan_rpm != null ? l.fan_rpm+' rpm' : '—';
+      $('sclk').textContent = fmt(l.sclk_mhz,0); $('mclk').textContent = fmt(l.mclk_mhz,0)+' MHz'; $('busy').textContent = l.gpu_busy != null ? l.gpu_busy+' %' : '—';
+      $('vo').textContent = l.offset_mv != null ? l.offset_mv+' mV' : '—';
+      hist.push({power: l.power_w, tj: l.junction_c, cap: l.cap_w, sleep:false});
+    } else {
+      ['pw','tj','sclk'].forEach(id => $(id).textContent = '—'); $('pwbar').style.width = '0%';
+      $('vo').textContent = tuned ? `${tuned.offset_mv} mV (config; card asleep)` : '—'; $('fan').textContent = '0 rpm (firmware)';
+      hist.push({power:null, tj:null, cap:null, sleep:true});
+    }
+    while (hist.length > MAXH) hist.shift(); draw();
+    if (s.recent_journal) $('journal').textContent = s.recent_journal.join ? s.recent_journal.join('\n') : s.recent_journal;
+    markProfile();
+  }
+
+  // ---- sliders ----
+  const syncOut = () => { $('voOut').textContent = $('voSlider').value + ' mV'; $('capOut').textContent = $('capSlider').value + ' W'; if (ranges) applyRanges(ranges); };
+  $('voSlider').addEventListener('input', syncOut); $('capSlider').addEventListener('input', syncOut);
+
+  async function post(path, body, label){
+    const btns = document.querySelectorAll('button'); btns.forEach(b=>b.disabled=true);
+    try { const r = await api(path, {method:'POST', body: JSON.stringify(body||{})});
+      const bad = (r.steps||[]).filter(s=>s.rc!==0);
+      if (r.ok !== false && !bad.length) toast(label + ' ✓ ' + (r.steps||[]).map(s=>s.stdout).join(' ').trim().slice(0,160), 'ok');
+      else toast(label + ' failed: ' + bad.map(s=>(s.stderr||s.stdout)).join(' | ').slice(0,300), 'bad');
+      refreshStatus();
+    } catch(e){ toast(label + ' error: ' + e.message, 'bad'); }
+    finally { btns.forEach(b=>b.disabled=false); }
+  }
+  $('applyBtn').onclick = () => post('/api/set', {offset_mv: Number($('voSlider').value), cap_w: Number($('capSlider').value)}, 'Apply');
+  $('reapplyBtn').onclick = () => post('/api/apply', {}, 'Re-apply');
+  $('resetBtn').onclick = () => { if (confirm('Restore AMD defaults now? Power cap goes to the hardware default and the OD table is reset. The config file is not changed.')) post('/api/reset', {}, 'Restore defaults'); };
+  $('benchBtn').onclick = async () => {
+    const label = `vo${$('voSlider').value}_cap${$('capSlider').value}_ui`;
+    await post('/api/bench/run', {label}, 'Benchmark started'); pollBench();
+  };
+
+  // ---- profiles ----
+  function markProfile(){
+    if (!tuned) return;
+    document.querySelectorAll('.profile').forEach(el => el.classList.toggle('current', Number(el.dataset.vo)===tuned.offset_mv && Number(el.dataset.cap)===tuned.cap_w));
+  }
+  async function loadProfiles(){
+    try { profiles = await api('/api/profiles'); } catch(e){ profiles = []; }
+    const box = $('profiles'); box.innerHTML = '';
+    profiles.forEach(p => {
+      const el = document.createElement('div'); el.className='profile'; el.dataset.vo=p.offset_mv; el.dataset.cap=p.cap_w;
+      el.innerHTML = `<span class="tag">${p.measured?'MEASURED':'PLACEHOLDER'}</span><div class="name">${p.name}</div><div class="vals">${p.offset_mv} mV · ${p.cap_w} W</div>`;
+      el.onclick = () => { $('voSlider').value = p.offset_mv; $('capSlider').value = p.cap_w; syncOut(); toast(`Profile ${p.name} loaded into the sliders — press Apply`); };
+      box.appendChild(el);
+    }); markProfile();
+  }
+
+  // ---- benchmarks ----
+  async function loadBench(){
+    try { const rows = await api('/api/bench'); const tb = $('bench').querySelector('tbody'); tb.innerHTML='';
+      const best = rows.reduce((a,b)=> (b.tok_s_per_w||0) > (a?.tok_s_per_w||0) ? b : a, null);
+      rows.forEach(r => { const tr=document.createElement('tr'); if (r===best) tr.className='best';
+        tr.innerHTML = `<td>${r.label||''}</td><td>${fmt(r.offset_mv)}</td><td>${fmt(r.cap_w)}</td><td>${fmt(r.gen_tok_s,1)}</td><td>${fmt(r.agg_tok_s,1)}</td><td>${fmt(r.mean_power_w,0)}</td><td>${fmt(r.tok_s_per_w,3)}</td><td>${fmt(r.max_junction_c,0)}</td><td>${r.stable===true?'Y':(r.stable===false?'N':'—')}</td><td>${fmt(r.errors)}</td><td>${fmt(r.d3cold_s,1)}</td><td>${(r.timestamp||'').replace('T',' ').slice(0,16)}</td>`;
+        tb.appendChild(tr); });
+      if (!rows.length) tb.innerHTML = '<tr><td colspan="12" class="muted">no results yet</td></tr>';
+    } catch(e){ $('benchstate').textContent = 'unavailable: '+e.message; }
+  }
+  let benchTimer = null;
+  async function pollBench(){
+    clearTimeout(benchTimer);
+    try { const st = await api('/api/bench/status');
+      if (st.running) { $('benchstate').textContent = `· running ${st.label||''}`; $('benchlog').style.display='block'; $('benchlog').textContent = (st.tail||[]).join('\n'); benchTimer = setTimeout(pollBench, 3000); }
+      else { $('benchstate').textContent = ''; if ($('benchlog').style.display==='block') { $('benchlog').textContent = (st.tail||[]).join('\n'); } loadBench(); }
+    } catch(e){}
+  }
+
+  // ---- status + SSE ----
+  async function refreshStatus(){ try { render(await api('/api/status')); } catch(e){ setPill($('state'),'err','API: '+e.message); } }
+  function connectSSE(){
+    try { const es = new EventSource('/api/events?t='+encodeURIComponent(TOKEN));
+      es.onmessage = ev => { try { render(JSON.parse(ev.data)); } catch(e){} };
+      es.onerror = () => { es.close(); setTimeout(connectSSE, 4000); };
+    } catch(e){ setInterval(refreshStatus, 2000); }
+  }
+  refreshStatus().then(() => { if (tuned) { $('voSlider').value = tuned.offset_mv; $('capSlider').value = tuned.cap_w; syncOut(); } });
+  loadProfiles(); loadBench(); pollBench(); connectSSE();
+  setInterval(() => api('/api/status').then(s => { if (s.recent_journal) $('journal').textContent = s.recent_journal.join('\n'); }).catch(()=>{}), 10000);
+})();
+</script>
+</body>
+</html>
