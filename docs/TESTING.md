@@ -83,3 +83,24 @@ the branch commit id in `docs/` history (paste the table into the PR/commit).
 
 udev rule backups from the first install are kept beside the rules with a
 `.bak-<date>` suffix (see README).
+
+## 5. Dashboard hazard test (must pass after any change to tools/r9700-ui.py)
+
+The dashboard's live sampling must never hold the card awake. With the server
+running and a client connected:
+
+    TOK=$(journalctl --user -u r9700-ui.service --no-pager | grep -o 'TOKEN: [0-9a-f]*' | tail -1 | cut -d' ' -f2)
+    (timeout 75 curl -s -N "http://127.0.0.1:7970/api/events?t=$TOK" > /tmp/sse.log &)
+    python3 -c "import os,time; fd=os.open('/dev/dri/renderD128', os.O_RDWR|os.O_CLOEXEC); time.sleep(10); os.close(fd)"
+    # then watch /sys/bus/pci/devices/<pci>/power/runtime_status
+
+PASS: `runtime_status` returns to `suspended` (and `power_state` to `D3cold`)
+within 30 s of the release while the SSE client stays connected, and the SSE
+stream shows the sampling mode go `busy` → `idle-backoff` → `asleep`.
+Measured 2026-09-04: 20 s. A 2 s fixed sensor poll fails this test (card stays
+`active` at 0 % busy indefinitely).
+
+Start the server as a transient user unit so it survives the shell:
+
+    systemd-run --user --unit r9700-ui --working-directory=$HOME/src/r9700-tunerd --collect python3 tools/r9700-ui.py
+    journalctl --user -u r9700-ui.service | grep TOKEN
