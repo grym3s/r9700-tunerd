@@ -3,19 +3,19 @@
 Phases are gated: nothing moves to the next phase until the previous one is
 validated on the live card.
 
-1. **Core hardening** (in progress) – config validation, restart-storm safety,
+1. **Core hardening** (DONE 2026-09-04, accepted on hardware) – config validation, restart-storm safety,
    unit hardening, unit tests without hardware, `status`/`reset` polish,
    optional `--dry-run`.
-2. **Reboot acceptance** – boot → idle → D3cold; workload → active → -25 mV
+2. **Reboot acceptance** (DONE 2026-09-04, docs/ACCEPTANCE-2026-09-04.md) – boot → idle → D3cold; workload → active → -25 mV
    restored, cap 210 W; stop → D3cold; no tuner DRM handles. Requires user approval
    to reboot.
-3. **Real-workload validation** – the user's llama-server / Qwen workload:
+3. **Real-workload validation** (first measurement done at -25 mV / 210 W; harness v3) – the user's llama-server / Qwen workload:
    stability, VO, power, hotspot, clocks, tokens/s, tokens/s/W, D3cold recovery.
 4. **Undervolt characterisation** – automated benchmark/results harness;
    -50/-75/-100 mV candidates; objective is best sustained throughput per watt with
    zero instability, not the largest offset. Then EFFICIENCY / BALANCED /
    PERFORMANCE profiles from measured data.
-5. **GPU tuning UI** (owner's direction: this becomes a general GPU tuning tool)
+5. **GPU tuning UI** (v1 DONE 2026-09-04: tools/r9700-ui.py + ui/index.html; next: tray/launcher integration, profile editing, matrix results view)
    – a thin front end over the daemon: voltage-offset slider bounded by the live
    `OD_RANGE`, power-cap slider bounded by `power1_cap_min/max`, profile buttons,
    Apply / Benchmark / Restore-defaults, live state (D3cold / active / tuned,

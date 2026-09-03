@@ -19,7 +19,8 @@ No DRM/render-node handles. No LACT on the control path. No fan curve yet.
     r9700-tunerd apply
     r9700-tunerd watch
     r9700-tunerd reset
-    r9700-tunerd set-undervolt -50
+    r9700-tunerd set-undervolt -50     # validated against the live or cached OD range
+    r9700-tunerd set-power-cap 250     # validated against the live or cached cap range
     r9700-tunerd probe-poll
 
 ## Rollback
@@ -30,3 +31,14 @@ No DRM/render-node handles. No LACT on the control path. No fan curve yet.
     sudo cp /etc/udev/rules.d/99-amd-igpu.rules.bak-20260903-r9700 /etc/udev/rules.d/99-amd-igpu.rules
     sudo udevadm control --reload-rules
     sudo udevadm trigger --subsystem-match=drm --action=add
+
+## Tools
+
+- `tools/r9700-ui.py` — local dashboard backend; open the printed URL. See docs/UI.md.
+- `tools/r9700-bench.py` — read-only real-workload measurement (`run`, `sample`, `compare`).
+- `tools/r9700-matrix.py` — gated one-step-at-a-time undervolt/cap characterisation (owner approval required before running).
+- `tests/hw/r9700-hwtest.py` — root-run hardware validation; `.venv/bin/python -m pytest -q tests/` for the unit suite.
+
+## Docs
+
+docs/ARCHITECTURE.md · docs/AMDGPU-R9700-NOTES.md · docs/TESTING.md · docs/ACCEPTANCE-2026-09-04.md · docs/UI.md · docs/ROADMAP.md
