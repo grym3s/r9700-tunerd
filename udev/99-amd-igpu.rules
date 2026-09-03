@@ -1,0 +1,6 @@
+# Strix Halo integrated GPU — stable regardless of PCI bus numbering.
+# Hyprland pins AQ_DRM_DEVICES=/dev/dri/amd-igpu; do not remove this name.
+KERNEL=="card[0-9]*", SUBSYSTEM=="drm", \
+  ATTRS{vendor}=="0x1002", ATTRS{device}=="0x1586", \
+  ATTRS{subsystem_vendor}=="0x1f66", ATTRS{subsystem_device}=="0x0030", \
+  SYMLINK+="dri/amd-igpu"

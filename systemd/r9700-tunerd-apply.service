@@ -1,0 +1,10 @@
+[Unit]
+Description=R9700 tuner oneshot apply (add/bind)
+Documentation=file:///usr/local/share/doc/r9700-tunerd/README.md
+After=systemd-udev-settle.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/r9700-tunerd apply
+Nice=10
+PrivateTmp=yes

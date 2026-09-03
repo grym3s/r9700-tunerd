@@ -1,0 +1,17 @@
+[Unit]
+Description=R9700 runtime-PM-aware tuner (runtime_status watcher)
+Documentation=file:///usr/local/share/doc/r9700-tunerd/README.md
+After=systemd-udev-settle.service
+ConditionPathExists=/sys/bus/pci
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/r9700-tunerd watch
+Restart=on-failure
+RestartSec=5
+Nice=10
+# Never touch DRM/render nodes; sysfs only.
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

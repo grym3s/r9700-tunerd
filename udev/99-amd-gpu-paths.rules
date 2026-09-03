@@ -1,0 +1,27 @@
+# Stable DRM names for the two AMD GPUs. Do not match PCI bus addresses;
+# OCuLink/hotplug and firmware enumeration can move those.
+#
+# R9700 (ASUS Radeon AI PRO R9700 32GB) — vendor 1002, device 7551,
+# subsystem 1043:0626
+KERNEL=="card[0-9]*", SUBSYSTEM=="drm", \
+  ATTRS{vendor}=="0x1002", ATTRS{device}=="0x7551", \
+  ATTRS{subsystem_vendor}=="0x1043", ATTRS{subsystem_device}=="0x0626", \
+  SYMLINK+="dri/r9700"
+
+# Strix Halo iGPU extra name (Hyprland uses dri/amd-igpu from 99-amd-igpu.rules)
+KERNEL=="card[0-9]*", SUBSYSTEM=="drm", \
+  ATTRS{vendor}=="0x1002", ATTRS{device}=="0x1586", \
+  ATTRS{subsystem_vendor}=="0x1f66", ATTRS{subsystem_device}=="0x0030", \
+  SYMLINK+="dri/strix-halo"
+
+# Apply tuner on PCI add/bind. Do NOT key off ACTION=="change":
+# AMD runtime resume (D3cold -> active) is not assumed to emit a useful uevent.
+ACTION=="add", SUBSYSTEM=="pci", \
+  ATTR{vendor}=="0x1002", ATTR{device}=="0x7551", \
+  ATTR{subsystem_vendor}=="0x1043", ATTR{subsystem_device}=="0x0626", \
+  TAG+="systemd", ENV{SYSTEMD_WANTS}+="r9700-tunerd-apply.service"
+
+ACTION=="bind", SUBSYSTEM=="pci", DRIVER=="amdgpu", \
+  ATTR{vendor}=="0x1002", ATTR{device}=="0x7551", \
+  ATTR{subsystem_vendor}=="0x1043", ATTR{subsystem_device}=="0x0626", \
+  TAG+="systemd", ENV{SYSTEMD_WANTS}+="r9700-tunerd-apply.service"
