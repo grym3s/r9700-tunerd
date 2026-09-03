@@ -146,7 +146,7 @@ def parse_dpm_clock(text: str) -> int | None:
     """Extract MHz from the '*' (current) line of pp_dpm_sclk / pp_dpm_mclk."""
     for line in text.splitlines():
         if "*" in line:
-            m = re.search(r"(\d+)\s*MHz", line)
+            m = re.search(r"(\d+)\s*mhz", line, re.I)
             if m:
                 return int(m.group(1))
     return None
@@ -201,13 +201,13 @@ class Sampler:
         ts = time.time()
         status = self.gpu.runtime_status()
         pstate = self.gpu.power_state()
+        susp_ms = self.gpu.runtime_suspended_time()
         row: dict = {"ts": ts, "runtime_status": status, "power_state": pstate}
+        if susp_ms is not None:
+            row["runtime_suspended_time_ms"] = int(susp_ms)
 
         if status == "suspended":
             # Only safe-while-suspended files; do NOT touch hwmon or pp_*.
-            susp_ms = self.gpu.runtime_suspended_time()
-            if susp_ms is not None:
-                row["runtime_suspended_time_ms"] = int(susp_ms)
             return row
 
         if status != "active":
@@ -437,7 +437,7 @@ def cmd_run(args):
     csv_writer = csv.DictWriter(csv_file, fieldnames=CSV_FIELDS, extrasaction="ignore")
     csv_writer.writeheader()
     csv_file.flush()
-    sampler = Sampler(gpu, interval=1.0, csv_writer=csv_writer, csv_file=csv_file)
+    sampler = Sampler(gpu, interval=args.interval, csv_writer=csv_writer, csv_file=csv_file)
     sampler.start()
 
     # ── Send requests ──
@@ -447,14 +447,17 @@ def cmd_run(args):
         data, wall, err = send_chat_request(args.endpoint, args.model,
                                             PROMPTS[i], args.max_tokens)
         r = {"index": i, "wall_s": round(wall, 3), "error": err}
-        if data:
-            metrics = _extract_metrics(data)
-            r.update(metrics)
-            # Fallback: compute tok/s from completion_tokens / wall
-            if r.get("gen_tok_s") is None and r.get("completion_tokens", 0) > 0 and wall > 0:
-                r["gen_tok_s"] = round(r["completion_tokens"] / wall, 2)
-            if r.get("gen_tok_s") is not None:
-                r["gen_tok_s"] = round(r["gen_tok_s"], 2)
+        if data is not None:
+            if not isinstance(data, dict):
+                r["error"] = f"unexpected JSON response type: {type(data).__name__}"
+            else:
+                metrics = _extract_metrics(data)
+                r.update(metrics)
+                # Fallback: compute tok/s from completion_tokens / wall
+                if r.get("gen_tok_s") is None and r.get("completion_tokens", 0) > 0 and wall > 0:
+                    r["gen_tok_s"] = round(r["completion_tokens"] / wall, 2)
+                if r.get("gen_tok_s") is not None:
+                    r["gen_tok_s"] = round(r["gen_tok_s"], 2)
         results.append(r)
 
     # ── Stop sampler (workload done; do NOT keep GPU awake) ──
@@ -464,7 +467,7 @@ def cmd_run(args):
     # ── Aggregates ──
     ok = [r for r in results if not r["error"]]
     errors = [r for r in results if r["error"]]
-    gen_list = [r["gen_tok_s"] for r in ok if r.get("gen_tok_s")]
+    gen_list = [r["gen_tok_s"] for r in ok if r.get("gen_tok_s") is not None]
     total_comp = sum(r.get("completion_tokens", 0) for r in ok)
     total_wall = sum(r["wall_s"] for r in ok)
     agg_tok_s = total_comp / total_wall if total_wall > 0 else 0.0
@@ -486,14 +489,18 @@ def cmd_run(args):
         if caps:
             cap_stable = all(abs(c - pre["power_cap_w"]) < 0.1 for c in caps)
 
-    # Energy estimate (trapezoidal over active samples)
+    # Energy (trapezoidal integration over consecutive ACTIVE rows;
+    # skip pairs whose gap exceeds 3× interval — a suspend/resume boundary)
     energy_j = 0.0
-    for i in range(len(active_rows)):
-        if "power_w" not in active_rows[i]:
+    for i in range(1, len(active_rows)):
+        prev = active_rows[i - 1]
+        curr = active_rows[i]
+        if "power_w" not in prev or "power_w" not in curr:
             continue
-        dt = args.interval if i == 0 else (
-            active_rows[i]["ts"] - active_rows[i - 1]["ts"])
-        energy_j += active_rows[i]["power_w"] * max(dt, 0.1)
+        dt = curr["ts"] - prev["ts"]
+        if dt > 3 * args.interval:
+            continue
+        energy_j += 0.5 * (prev["power_w"] + curr["power_w"]) * max(dt, 0.1)
 
     # ── D3cold wait ──
     d3cold_s = wait_for_d3cold(gpu, timeout=60)
@@ -515,7 +522,7 @@ def cmd_run(args):
             "mean_power_w": round(mean(powers), 2) if powers else None,
             "max_power_w": round(max(powers), 2) if powers else None,
             "tok_per_joule": round(total_comp / energy_j, 4) if energy_j > 0 else None,
-            "tok_s_per_w": round(agg_tok_s / mean(powers), 4) if (powers and agg_tok_s) else None,
+            "tok_s_per_w": round(agg_tok_s / mean(powers), 4) if (powers and agg_tok_s is not None) else None,
             "max_junction_c": round(max(junctions), 1) if junctions else None,
             "min_sclk_mhz": min(sclk_vals) if sclk_vals else None,
             "max_sclk_mhz": max(sclk_vals) if sclk_vals else None,
@@ -629,6 +636,7 @@ def main():
                     help="(reserved; currently sequential only)")
     rp.add_argument("--label", default=None, help="label for output files")
     rp.add_argument("--out", default="~/r9700-bench", help="output directory")
+    rp.add_argument("--interval", type=float, default=1.0, help="seconds between samples")
     rp.set_defaults(func=cmd_run)
 
     # compare
