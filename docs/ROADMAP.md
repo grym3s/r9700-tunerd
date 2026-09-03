@@ -15,5 +15,13 @@ validated on the live card.
    -50/-75/-100 mV candidates; objective is best sustained throughput per watt with
    zero instability, not the largest offset. Then EFFICIENCY / BALANCED /
    PERFORMANCE profiles from measured data.
-5. **Later** – clock tuning, profiles command, hybrid active-load fan controller
-   (only if proven runtime-PM-safe), simple UI/tray.
+5. **GPU tuning UI** (owner's direction: this becomes a general GPU tuning tool)
+   – a thin front end over the daemon: voltage-offset slider bounded by the live
+   `OD_RANGE`, power-cap slider bounded by `power1_cap_min/max`, profile buttons,
+   Apply / Benchmark / Restore-defaults, live state (D3cold / active / tuned,
+   fan RPM or firmware mode). Prerequisites, in order: (a) a machine-readable
+   `status --json` and a small local IPC (unix socket) so the UI never touches
+   sysfs itself and never holds the card awake; (b) profiles from Phase 4 data.
+   Not before Phases 2–4 are accepted.
+6. **Later** – clock tuning, hybrid active-load fan controller (only if proven
+   runtime-PM-safe), multi-GPU support beyond the R9700.

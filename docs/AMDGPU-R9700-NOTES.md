@@ -37,6 +37,19 @@ is exactly what keeps a mistyped identity from ever tuning the iGPU.
 - Hyprland holding a `card1` handle and llama-server holding `renderD128` have not
   prevented D3cold in practice. Treat as non-blocking unless evidence changes.
 
+## Autosuspend timing and why edge polling is not enough (measured 2026-09-03)
+
+- After the last user of the card goes away, `runtime_status` stays `active` for
+  the autosuspend delay (`power/autosuspend_delay_ms`), then the card passes
+  through `suspended` into D3cold almost at once (~6 s after release in tests).
+- Consequence: with a 2 s poll, a wake that follows a suspend by < 2 s can hide
+  the entire `suspended` window from the poller. Five back-to-back cycles missed
+  3 of 5 wakes this way; the resume still reset the offset to 0.
+- `power/runtime_suspended_time` (ms, monotonic) increments on every suspend and
+  reading it does not wake the card (20 reads at 0.5 s while in D3cold, status
+  unchanged). The watcher therefore treats "counter grew since the last handled
+  wake" as a wake, whether or not a `suspended` sample was ever observed.
+
 ## Power cap (`hwmon/power1_cap`, microwatts)
 
 | min | default | max |
