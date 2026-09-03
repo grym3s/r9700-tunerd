@@ -715,7 +715,7 @@ def cmd_reset(conf: dict) -> int:
     if not is_active(pci):
         log(f"reset skipped: runtime_status={runtime_status(pci)}")
         return 0
-    # Runtime-PM write guard: refuse before touching the config file.
+    # Runtime-PM write guard: refuse before any sysfs write.
     try:
         require_runtime_pm(pci)
     except RuntimeError as e:
