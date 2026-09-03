@@ -750,7 +750,8 @@ def handle_wake(pci: Path, conf: dict, cap_checked: bool) -> bool:
             log(msg, syslog.LOG_WARNING)
         _last_pm_refusal = msg
         # Do NOT call restore_voltage or the cap path.
-        write_state(f"pci={pci.name}\nstate=ACTIVE_CONFIGURED\nvo={want}\nts={int(time.time())}\n")
+        # Not configured: the offset was NOT written (runtime PM guard refused).
+        write_state(f"pci={pci.name}\nstate=ACTIVE_PM_REFUSED\nvo=stock\nts={int(time.time())}\n")
         return cap_checked
 
     # require_runtime_pm passed — log recovery if we were previously refused.
