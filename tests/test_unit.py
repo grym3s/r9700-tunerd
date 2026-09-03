@@ -281,7 +281,7 @@ def test_handle_wake_skips_when_control_on(
     fake_tree, conf, log_recorder, monkeypatch
 ):
     igpu = fake_tree / "0000:bb:00.0"
-    rt._runtime_pm_warned = False
+    rt._last_pm_refusal = None
 
     writes: list[tuple[str, str]] = []
     monkeypatch.setattr(
@@ -306,7 +306,7 @@ def test_handle_wake_restores_offset(
         "OD_VDDGFX_OFFSET:\n0mV\nOD_RANGE:\nVDDGFX_OFFSET: -200mV 0mV\n"
     )
     conf["VOLTAGE_OFFSET_MV"] = -25
-    rt._runtime_pm_warned = False
+    rt._last_pm_refusal = None
     rt._last_kernel_scan = 0.0
 
     writes: list[tuple[str, str]] = []
@@ -329,6 +329,118 @@ def test_handle_wake_restores_offset(
 
     all_msgs = [msg for _, msg in log_recorder]
     assert any("VDDGFX offset restored" in m for m in all_msgs)
+
+
+# ===================================================================
+# require_runtime_pm retry / refusal logging (Patch 1c)
+# ===================================================================
+
+
+def test_check_runtime_pm_auto_does_not_suppress_later_warning(
+    fake_tree, conf, log_recorder, monkeypatch
+):
+    """control=auto at startup must NOT suppress a later refusal warning."""
+    pci = fake_tree / "0000:aa:00.0"
+    rt._last_pm_refusal = None
+
+    # Startup check: control is "auto" → no warning, no flag set.
+    rt.check_runtime_pm(pci)
+    assert rt._last_pm_refusal is None
+
+    # Now flip control to "on" (simulating operator change).
+    (pci / "power" / "control").write_text("on\n")
+
+    # Monkeypatch restore_voltage to raise if called (it must not be).
+    def _boom(*a, **kw):
+        raise AssertionError("restore_voltage must not be called when PM refuses")
+
+    monkeypatch.setattr(rt, "restore_voltage", _boom)
+
+    rt.handle_wake(pci, conf, False)
+
+    warnings = [msg for level, msg in log_recorder if level == syslog.LOG_WARNING]
+    assert any("control=on" in w for w in warnings)
+
+
+def test_handle_wake_pm_refusal_logged_once_then_recovery(
+    fake_tree, conf, log_recorder, monkeypatch
+):
+    """Two refusals → one WARNING; recovery → INFO 'guard OK again' + restore."""
+    pci = fake_tree / "0000:aa:00.0"
+    rt._last_pm_refusal = None
+    rt._last_kernel_scan = 0.0
+
+    # Set control to "on" (refusal state).
+    (pci / "power" / "control").write_text("on\n")
+
+    # First refusal.
+    rt.handle_wake(pci, conf, False)
+    # Second refusal (same message → deduped).
+    rt.handle_wake(pci, conf, False)
+
+    warnings = [msg for level, msg in log_recorder if level == syslog.LOG_WARNING]
+    control_on_warnings = [w for w in warnings if "control=on" in w]
+    assert len(control_on_warnings) == 1
+
+    # Flip back to "auto" → recovery.
+    (pci / "power" / "control").write_text("auto\n")
+
+    # OD is already at 0 mV and conf wants 0 → "already 0" path.
+    result = rt.handle_wake(pci, conf, False)
+    assert result is True  # cap_checked set
+
+    infos = [msg for level, msg in log_recorder if level == syslog.LOG_INFO]
+    assert any("guard OK again" in m for m in infos)
+
+
+def test_require_runtime_pm_retries_on_transient_eio(fake_tree, monkeypatch):
+    """Two EIO errors then success → no exception, exactly 3 reads."""
+    pci = fake_tree / "0000:aa:00.0"
+    calls: list[Path] = []
+
+    def fake_read_text(path):
+        calls.append(path)
+        if len(calls) <= 2:
+            raise OSError(errno.EIO, "eio")
+        return "auto"
+
+    monkeypatch.setattr(rt, "read_text", fake_read_text)
+
+    # Should not raise.
+    rt.require_runtime_pm(pci)
+    assert len(calls) == 3
+
+
+def test_require_runtime_pm_gives_up_after_three_errors(fake_tree, monkeypatch):
+    """Always OSError → RuntimeError with 'unreadable after retries'."""
+    pci = fake_tree / "0000:aa:00.0"
+    calls: list[Path] = []
+
+    def fake_read_text(path):
+        calls.append(path)
+        raise OSError(errno.EIO, "eio")
+
+    monkeypatch.setattr(rt, "read_text", fake_read_text)
+
+    with pytest.raises(RuntimeError, match="unreadable after retries"):
+        rt.require_runtime_pm(pci)
+    assert len(calls) == 3
+
+
+def test_require_runtime_pm_refuses_on_without_retry(fake_tree, monkeypatch):
+    """control=on → immediate RuntimeError after exactly one read."""
+    pci = fake_tree / "0000:bb:00.0"  # fixture sets control=on
+    calls: list[Path] = []
+
+    def fake_read_text(path):
+        calls.append(path)
+        return "on"
+
+    monkeypatch.setattr(rt, "read_text", fake_read_text)
+
+    with pytest.raises(RuntimeError, match="control=on"):
+        rt.require_runtime_pm(pci)
+    assert len(calls) == 1
 
 
 # ===================================================================
@@ -402,7 +514,7 @@ def test_watch_loop_keeps_last_good_config(
 
     # Reset module-level state
     rt._stop = False
-    rt._runtime_pm_warned = False
+    rt._last_pm_refusal = None
     rt._last_kernel_scan = 0.0
 
     # --- Instrument time.sleep ------------------------------------------

@@ -65,7 +65,7 @@ KERNEL_OD_NOISE = re.compile(
 _HEX_RE = re.compile(r"^0x[0-9a-f]{4}$")
 
 _stop = False
-_runtime_pm_warned = False
+_last_pm_refusal: str | None = None
 _last_kernel_scan = 0.0
 
 
@@ -128,7 +128,7 @@ def write_text(path: Path, value: str) -> None:
 
 
 def _atomic_write(path: Path, data: bytes) -> None:
-    """Write data to path atomically via tempfile + os.replace in same directory."""
+    """Write data to path atomically via tempfile + os.replace in same directory. A SIGKILL between mkstemp and os.replace can leave a .r9700-tunerd-* temp file beside the target; harmless, remove by hand."""
     dir_ = path.parent
     mode = 0o644
     if path.is_file():
@@ -290,20 +290,18 @@ def discover(conf: dict, *, required: bool = True) -> Path | None:
 
 def check_runtime_pm(pci: Path) -> None:
     """Warn once per daemon start if power/control is not 'auto'."""
-    global _runtime_pm_warned
-    if _runtime_pm_warned:
-        return
+    global _last_pm_refusal
     try:
         val = read_text(pci / "power" / "control")
     except OSError:
         return
     if val != "auto":
-        log(
+        msg = (
             f"power/control={val}; runtime PM disabled by operator, "
-            "watcher will never see suspend",
-            syslog.LOG_WARNING,
+            "watcher will never see suspend"
         )
-    _runtime_pm_warned = True
+        log(msg, syslog.LOG_WARNING)
+        _last_pm_refusal = msg
 
 
 def require_runtime_pm(pci: Path) -> None:
@@ -312,18 +310,23 @@ def require_runtime_pm(pci: Path) -> None:
     On an APU the display iGPU runs with control=on, so this guard is what
     stops a mistyped identity from tuning the display GPU.
     """
-    try:
-        val = read_text(pci / "power" / "control")
-    except OSError:
-        raise RuntimeError(
-            "power/control unreadable; this tool only writes to "
-            "runtime-PM-managed GPUs (control=auto); refusing"
-        )
-    if val != "auto":
-        raise RuntimeError(
-            f"power/control={val}; this tool only writes to "
-            "runtime-PM-managed GPUs (control=auto); refusing"
-        )
+    last_err: OSError | None = None
+    for attempt in range(3):
+        try:
+            val = read_text(pci / "power" / "control")
+        except OSError as e:
+            last_err = e
+            if attempt < 2:
+                time.sleep(0.1)
+            continue
+        # Successfully read the value.
+        if val != "auto":
+            raise RuntimeError(
+                f"power/control={val}; this tool only writes to "
+                "runtime-PM-managed GPUs (control=auto); refusing"
+            )
+        return  # "auto" → pass
+    raise RuntimeError(f"power/control unreadable after retries: {last_err}")
 
 
 def runtime_status(pci: Path) -> str:
@@ -733,7 +736,7 @@ def handle_wake(pci: Path, conf: dict, cap_checked: bool) -> bool:
     Exactly one VO restore attempt cycle per wake. Cap is written only if
     missing (startup verify, or readback proves loss after reset).
     """
-    global _runtime_pm_warned
+    global _last_pm_refusal
     log("R9700 runtime active")
     # conf is validated: VOLTAGE_OFFSET_MV is already an int.
     want = conf["VOLTAGE_OFFSET_MV"]
@@ -742,12 +745,18 @@ def handle_wake(pci: Path, conf: dict, cap_checked: bool) -> bool:
     try:
         require_runtime_pm(pci)
     except RuntimeError as e:
-        if not _runtime_pm_warned:
-            log(str(e), syslog.LOG_WARNING)
-            _runtime_pm_warned = True
+        msg = str(e)
+        if msg != _last_pm_refusal:
+            log(msg, syslog.LOG_WARNING)
+        _last_pm_refusal = msg
         # Do NOT call restore_voltage or the cap path.
         write_state(f"pci={pci.name}\nstate=ACTIVE_CONFIGURED\nvo={want}\nts={int(time.time())}\n")
         return cap_checked
+
+    # require_runtime_pm passed — log recovery if we were previously refused.
+    if _last_pm_refusal is not None:
+        log("runtime PM guard OK again (power/control=auto)")
+        _last_pm_refusal = None
 
     try:
         result = restore_voltage(pci, conf)
