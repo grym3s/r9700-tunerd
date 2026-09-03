@@ -189,6 +189,7 @@ pre.log{margin:0;font-family:var(--mono);font-size:12px;color:#b9c4cf;background
       ctx.stroke();
     };
     line('power', cap, '#ff5c1a'); line('tj', 110, '#5aa9ff');
+    ctx.fillStyle='rgba(255,255,255,.05)'; hist.forEach((h,i)=>{ if (h.stale) ctx.fillRect(i*(W/(MAXH-1)), 0, W/(MAXH-1)+1, H); });
     ctx.fillStyle='#ff5c1a'; ctx.font='12px ui-monospace,monospace'; ctx.fillText('power W (0–'+cap+')', 12, 16);
     ctx.fillStyle='#5aa9ff'; ctx.fillText('junction °C (0–110)', 150, 16);
     // sleep markers
@@ -214,13 +215,21 @@ pre.log{margin:0;font-family:var(--mono);font-size:12px;color:#b9c4cf;background
     $('pci').textContent = s.pci || '—';
     $('clock').textContent = new Date().toLocaleTimeString();
     const active = s.runtime_status === 'active';
-    setPill($('state'), active ? 'active' : 'sleep', active ? 'ACTIVE' + (s.live && s.live.offset_mv===s.tuned.offset_mv ? ' · tuned' : ' · restoring…') : (s.power_state || 'suspended').toUpperCase() + ' · sleeping');
+    setPill($('state'), active ? 'active' : 'sleep', active ? 'ACTIVE' + (s.live && s.tuned && s.live.offset_mv===s.tuned.offset_mv ? ' · tuned' : ' · restoring…') + ((s.sampling||{}).mode==='idle-backoff' ? ' · idle' : '') : (s.power_state || 'suspended').toUpperCase() + ' · sleeping');
     const svc = s.service || {}; setPill($('svc'), svc.active ? 'active' : 'err', svc.active ? `watcher pid ${svc.pid||''}` : 'watcher DOWN');
     $('rts').textContent = s.runtime_status; $('pst').textContent = s.power_state; $('ctl').textContent = s.control;
     $('susp').textContent = s.suspended_ms != null ? (s.suspended_ms/1000).toFixed(0)+' s total' : '—';
     tuned = s.tuned || tuned; if (tuned) $('tuned').textContent = `${tuned.offset_mv} mV / ${tuned.cap_w} W`;
     applyRanges(s.ranges);
     const l = s.live;
+    const smp = s.sampling || {};
+    if (smp.mode === 'idle-backoff') {
+      $('tracehint').textContent = `(card idle: sensors sampled every ~9 s so it can sleep; last read ${s.live_age_s!=null?Math.round(s.live_age_s):'?'} s ago)`;
+    } else if (smp.mode === 'busy') {
+      $('tracehint').textContent = '(workload running: sampling every 2 s)';
+    } else {
+      $('tracehint').textContent = '(samples only while the card is awake)';
+    }
     if (active && l) {
       $('pw').textContent = fmt(l.power_w,0); $('cap').textContent = fmt(l.cap_w,0)+' W';
       const pct = l.cap_w ? Math.min(100, (l.power_w||0)/l.cap_w*100) : 0; $('pwbar').style.width = pct+'%';
@@ -228,7 +237,7 @@ pre.log{margin:0;font-family:var(--mono);font-size:12px;color:#b9c4cf;background
       $('fan').textContent = l.fan_rpm != null ? l.fan_rpm+' rpm' : '—';
       $('sclk').textContent = fmt(l.sclk_mhz,0); $('mclk').textContent = fmt(l.mclk_mhz,0)+' MHz'; $('busy').textContent = l.gpu_busy != null ? l.gpu_busy+' %' : '—';
       $('vo').textContent = l.offset_mv != null ? l.offset_mv+' mV' : '—';
-      hist.push({power: l.power_w, tj: l.junction_c, cap: l.cap_w, sleep:false});
+      if (s.live_age_s == null || s.live_age_s < 2.5) hist.push({power: l.power_w, tj: l.junction_c, cap: l.cap_w, sleep:false}); else hist.push({power: l.power_w, tj: l.junction_c, cap: l.cap_w, sleep:false, stale:true});
     } else {
       ['pw','tj','sclk'].forEach(id => $(id).textContent = '—'); $('pwbar').style.width = '0%';
       $('vo').textContent = tuned ? `${tuned.offset_mv} mV (config; card asleep)` : '—'; $('fan').textContent = '0 rpm (firmware)';
