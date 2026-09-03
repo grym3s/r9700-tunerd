@@ -25,8 +25,8 @@ to stdout and is appended to `/var/log/r9700-hwtest.log`.
 | subcommand | what it proves |
 |---|---|
 | `idle [--timeout 90]` | card reaches `suspended`/`D3cold`; no tuner process holds a DRM node |
-| `cycles [--count 5]` | wake → offset restored ≤ 3.5 s → holds 3 s → cap unchanged → D3cold; journal shows exactly N restores and zero cap writes |
-| `storm [--count 10 --hold-ms 300]` | short wakes never crash/restart the watcher; card returns to D3cold; no ring timeout / reset / AER |
+| `cycles [--count 5] [--gap S]` | wake → offset restored ≤ 3.5 s → holds 3 s → cap unchanged → D3cold; journal shows exactly N detected wakes and zero cap writes. Default gap 0 is the hard back-to-back pattern that exposed the missed-wake bug; `--gap 10` is the relaxed pattern |
+| `storm [--count 10 --hold-ms 300]` | each iteration waits for an observed `suspended` sample and reopens immediately; the watcher must detect every wake (journal count == iterations), never restart, card returns to D3cold, no ring timeout / reset / AER (same kernel patterns as the daemon, pinned by a unit test) |
 | `config-typo` | a bad `VOLTAGE_OFFSET_MV` is logged once, the watcher keeps running with the last good config, and works again after the file is fixed (config is backed up and restored automatically) |
 | `sigterm` | `systemctl restart` while the card is active: old PID exits, new PID restores the offset within 5 s |
 | `reboot-check` | the full post-reboot acceptance table |
@@ -42,6 +42,15 @@ Quick regression after any daemon change (watcher installed and running):
     sudo tests/hw/r9700-hwtest.py storm
     sudo tests/hw/r9700-hwtest.py config-typo
     sudo tests/hw/r9700-hwtest.py sigterm
+
+## 2b. Measurement harness (`tools/r9700-bench.py`, no root)
+
+Read-only. `sample` streams GPU state to CSV (only `runtime_status`,
+`power_state`, `runtime_suspended_time` while asleep); `run` drives an
+OpenAI-compatible endpoint with a fixed prompt set while sampling and writes
+JSON+CSV with tok/s, power, temps, clocks, offset/cap stability and
+time-to-D3cold; `compare DIR` tabulates results by tok/s per W. It never changes
+tuning: set the offset/cap with `r9700-tunerd` first.
 
 ## 3. Reboot acceptance procedure
 
