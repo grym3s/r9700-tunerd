@@ -20,10 +20,11 @@ kept the card awake.
 2. Identify the GPU by PCI identity (`vendor/device/subsystem_vendor/subsystem_device`),
    never by `cardN`, `renderDN`, or PCI bus address. Discovery is repeated every loop
    so re-enumeration is survived.
-3. While the GPU is suspended, the only sysfs read allowed is
-   `power/runtime_status` (proven not to wake the device). Everything else
-   (`hwmon/*`, `pp_od_clk_voltage`, clocks) is read only after `runtime_status`
-   reads `active`.
+3. While the GPU is suspended, the only sysfs reads allowed are
+   `power/runtime_status`, `power_state` and `power/runtime_suspended_time`
+   (each proven not to wake the device). Everything else (`hwmon/*`,
+   `pp_od_clk_voltage`, clocks) is read only after `runtime_status` reads
+   `active`.
 4. Power cap survives D3cold; the VDDGFX offset does not. Therefore a wake restores
    the offset and only *verifies* the cap; the cap is written when it is proven lost.
 5. One apply attempt cycle per wake. No periodic re-writes.
@@ -56,6 +57,9 @@ kept the card awake.
 
 ```
 SUSPENDED ──runtime_status=="active"──► ACTIVE_UNCONFIGURED
+ACTIVE_CONFIGURED ──runtime_suspended_time grew──► ACTIVE_UNCONFIGURED
+   (a suspend+resume happened between two polls; the "suspended" sample was
+    never observed, but the counter proves it and the resume reset the offset)
    ▲                                          │ handle_wake():
    │                                          │  settle 350 ms, verify still active,
    │                                          │  read OD, validate range, write "vo N" + "c",
@@ -67,7 +71,9 @@ SUSPENDED ──runtime_status=="active"──► ACTIVE_UNCONFIGURED
 ```
 
 Poll interval is `POLL_INTERVAL_S` (default 2 s, floor 1 s). Config is re-read each
-loop. SIGTERM/SIGINT set a flag; the loop exits within one interval.
+loop; a bad edit keeps the last good config. amdgpu holds the card `active` for its
+5 s autosuspend delay after release, then it drops through `suspended` into D3cold
+almost at once, so the counter path is what makes back-to-back wakes reliable. SIGTERM/SIGINT set a flag; the loop exits within one interval.
 
 Observed restore latency after a natural wake: about 2.0–2.1 s.
 
