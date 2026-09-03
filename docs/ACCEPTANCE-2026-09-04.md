@@ -42,3 +42,19 @@ Build under test: the `patch3-resume-detect` daemon (commit 408999a, installed
 - Cold boot resets `power1_cap` to the 300 W default; runtime suspend does not.
 
 Verdict: Priority 2 (reboot acceptance) accepted on this build.
+
+## Final main build (473b5ef, Patch 3b + runner v2), installed 00:54
+
+| Test | Result | Note |
+|---|---|---|
+| `cycles --count 5` (00:54) | FAIL by journal count only | started 4 s after the restart while the card was still active and already tuned, so cycle 1 was not a D3cold wake (4 journal wakes for 5 cycles); every cycle still showed -25 mV held, cap 210 W, D3cold |
+| `storm` | PASS | 10/10 real wakes, PID stable, no kernel errors |
+| `config-typo` | PASS | |
+| `sigterm` | PASS | |
+| `cycles --count 5` (00:57, card settled first) | PASS | latency 2.0–2.1 s every cycle, 5 journal wakes, 0 cap writes |
+
+Lesson for the runner: `cycles` should wait for a settled `suspended/D3cold`
+card before cycle 1 (or the operator must), otherwise the journal-count check
+produces a false FAIL right after a restart.
+
+Verdict: Priorities 1 and 2 accepted on 473b5ef.
