@@ -173,6 +173,11 @@ def _build_status(include_journal=True):
     ps = GPU.power_state() if GPU else None
     susp = GPU.runtime_suspended_time() if GPU else None
     suspended_ms = int(susp) if susp is not None else None
+    # power/control is a device-PM attribute; reading it never wakes the card.
+    try:
+        control = (Path(pci) / "power" / "control").read_text().strip()
+    except OSError:
+        control = None
 
     tuned = {
         "offset_mv": int(CONFIG.get("VOLTAGE_OFFSET_MV", "0")),
@@ -263,7 +268,7 @@ def _build_status(include_journal=True):
 
     payload = {
         "ts": ts, "pci": pci, "runtime_status": rs, "power_state": ps,
-        "suspended_ms": suspended_ms, "control": "ui",
+        "suspended_ms": suspended_ms, "control": control,
         "tuned": tuned, "live": live, "ranges": ranges,
         "service": svc, "state_file": state_text,
     }
