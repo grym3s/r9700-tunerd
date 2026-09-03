@@ -517,6 +517,9 @@ def load_ranges() -> dict | None:
         data = json.loads(RANGES_PATH.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, ValueError):
         return None
+    if not isinstance(data, dict):
+        # Valid JSON that is not an object (null, 42, true): treat as no cache.
+        return None
     required = ("cap_min_w", "cap_max_w", "cap_default_w", "vo_min_mv", "vo_max_mv", "ts")
     for k in required:
         if k not in data or data[k] is None:

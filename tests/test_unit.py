@@ -1018,3 +1018,88 @@ def test_set_power_cap_rejects_out_of_range(fake_tree, conf, monkeypatch, tmp_pa
     text = conf_file.read_text(encoding="utf-8")
     assert "POWER_LIMIT_W=210" in text
     assert "POWER_LIMIT_W=400" not in text
+
+
+# ---------------------------------------------------------------------------
+# Cached live ranges (ranges.json)
+# ---------------------------------------------------------------------------
+
+def _ranges_file(tmp_path, monkeypatch, content):
+    rp = tmp_path / "state" / "ranges.json"
+    rp.parent.mkdir(parents=True, exist_ok=True)
+    if content is not None:
+        rp.write_text(content)
+    monkeypatch.setattr(rt, "RANGES_PATH", rp)
+    return rp
+
+
+def _suspend(fake_tree):
+    pci = fake_tree / "0000:aa:00.0"
+    (pci / "power" / "runtime_status").write_text("suspended\n")
+    (pci / "power_state").write_text("D3cold\n")
+    return pci
+
+
+def test_load_ranges_rejects_partial_file(fake_tree, monkeypatch, tmp_path):
+    _ranges_file(tmp_path, monkeypatch, '{"cap_min_w": 210, "cap_max_w": 330}')
+    assert rt.load_ranges() is None
+    _ranges_file(tmp_path, monkeypatch, "null")
+    assert rt.load_ranges() is None
+    _ranges_file(tmp_path, monkeypatch, "not json")
+    assert rt.load_ranges() is None
+    _ranges_file(tmp_path, monkeypatch, '{"cap_min_w": 210, "cap_max_w": 330, "cap_default_w": 300, "vo_min_mv": -200, "vo_max_mv": 0, "ts": 1}')
+    assert rt.load_ranges()["cap_max_w"] == 330
+
+
+def test_set_power_cap_suspended_uses_cached_range(fake_tree, conf, monkeypatch, tmp_path, log_recorder):
+    _suspend(fake_tree)
+    _ranges_file(tmp_path, monkeypatch, '{"cap_min_w": 210, "cap_max_w": 330, "cap_default_w": 300, "vo_min_mv": -200, "vo_max_mv": 0, "ts": 1}')
+    conf_file = tmp_path / "test.conf"
+    conf_file.write_text("POWER_LIMIT_W=210\nVOLTAGE_OFFSET_MV=0\n")
+    monkeypatch.setattr(rt, "CONF_PATH", conf_file)
+    monkeypatch.setattr(rt, "cmd_apply", lambda c: 0)
+    assert rt.cmd_set_power_cap(conf, 250) == 0
+    assert "POWER_LIMIT_W=250" in conf_file.read_text()
+    with pytest.raises(SystemExit):
+        rt.cmd_set_power_cap(conf, 400)
+    assert "POWER_LIMIT_W=250" in conf_file.read_text()  # untouched by the refused call
+
+
+def test_set_undervolt_suspended_without_cache_dies(fake_tree, conf, monkeypatch, tmp_path, log_recorder):
+    _suspend(fake_tree)
+    _ranges_file(tmp_path, monkeypatch, None)  # no cache file
+    conf_file = tmp_path / "test.conf"
+    conf_file.write_text("POWER_LIMIT_W=210\nVOLTAGE_OFFSET_MV=0\n")
+    monkeypatch.setattr(rt, "CONF_PATH", conf_file)
+    monkeypatch.setattr(rt, "cmd_apply", lambda c: 0)
+    with pytest.raises(SystemExit):
+        rt.cmd_set_undervolt(conf, -50)
+    assert "VOLTAGE_OFFSET_MV=0" in conf_file.read_text()
+
+
+def test_handle_wake_writes_ranges(fake_tree, conf, monkeypatch, tmp_path, log_recorder):
+    rp = _ranges_file(tmp_path, monkeypatch, None)
+    pci = fake_tree / "0000:aa:00.0"
+    conf["VOLTAGE_OFFSET_MV"] = -25
+    od_path = pci / "pp_od_clk_voltage"
+
+    def fake_write_text(path, value):
+        if "pp_od_clk_voltage" in str(path) and value == "vo -25\n":
+            od_path.write_text("OD_VDDGFX_OFFSET:\n-25mV\nOD_RANGE:\nVDDGFX_OFFSET: -200mV 0mV\n")
+
+    monkeypatch.setattr(rt, "write_text", fake_write_text)
+    rt.handle_wake(pci, conf, False)
+    assert rp.exists()
+    data = rt.load_ranges()
+    assert data is not None and data["vo_min_mv"] == -200 and data["cap_min_w"] == 210
+
+
+def test_set_undervolt_active_refreshes_cache(fake_tree, conf, monkeypatch, tmp_path, log_recorder):
+    rp = _ranges_file(tmp_path, monkeypatch, None)
+    conf_file = tmp_path / "test.conf"
+    conf_file.write_text("POWER_LIMIT_W=210\nVOLTAGE_OFFSET_MV=0\n")
+    monkeypatch.setattr(rt, "CONF_PATH", conf_file)
+    monkeypatch.setattr(rt, "cmd_apply", lambda c: 0)
+    assert rt.cmd_set_undervolt(conf, -25) == 0
+    assert "VOLTAGE_OFFSET_MV=-25" in conf_file.read_text()
+    assert rp.exists() and rt.load_ranges()["vo_min_mv"] == -200
