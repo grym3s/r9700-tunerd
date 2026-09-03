@@ -24,6 +24,7 @@ from pathlib import Path
 DAEMON = "/usr/local/sbin/r9700-tunerd"
 BENCH_DEFAULT = "tools/r9700-bench.py"
 MATRIX_CSV = "matrix.csv"
+CONF_PATH = Path("/etc/r9700-tunerd.conf")
 
 # ── Kernel-log gate: dangerous patterns (case-insensitive) ──────────────────
 DANGEROUS_KERNEL = [
@@ -32,13 +33,15 @@ DANGEROUS_KERNEL = [
     re.compile(r"SMU\s+timeout", re.I),
     re.compile(r"\bAER\b"),
     re.compile(r"device\s+removed", re.I),
+    re.compile(r"amdgpu.*\bfatal\b", re.I),
+    re.compile(r"amdgpu.*\bhang\b", re.I),
 ]
 
 # ── Kernel-log gate: benign OD re-upload lines (daemon watcher after D3cold) ─
 BENIGN_KERNEL = [
-    re.compile(r"amdgpu.*OD.*re-?upload", re.I),
-    re.compile(r"amdgpu.*pp_od.*restore", re.I),
-    re.compile(r"amdgpu.*smu.*od.*apply", re.I),
+    re.compile(r"Failed to upload overdrive table", re.I),
+    re.compile(r"OD_UNSUPPORTED_FEATURE", re.I),
+    re.compile(r"Failed to upload customized OD settings", re.I),
 ]
 
 MATRIX_FIELDS = [
@@ -60,47 +63,112 @@ def run_cmd(cmd: list[str], timeout: float = 30) -> tuple[int, str, str]:
         return -1, "", f"command not found: {cmd[0]}"
 
 
+def read_config() -> dict:
+    """Read POWER_LIMIT_W and VOLTAGE_OFFSET_MV from /etc/r9700-tunerd.conf.
+
+    Returns a dict that may contain 'cap_w' and 'offset_mv' (both int).
+    """
+    cfg: dict = {}
+    if not CONF_PATH.exists():
+        return cfg
+    try:
+        for line in CONF_PATH.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key = key.strip()
+            val = val.strip()
+            if key == "POWER_LIMIT_W":
+                try:
+                    cfg["cap_w"] = int(val)
+                except ValueError:
+                    pass
+            elif key == "VOLTAGE_OFFSET_MV":
+                try:
+                    cfg["offset_mv"] = int(val)
+                except ValueError:
+                    pass
+    except OSError:
+        pass
+    return cfg
+
+
 def parse_status(stdout: str) -> dict:
     """Extract current values and valid ranges from r9700-tunerd status.
 
-    Returns a dict that may contain: offset_mv, cap_w,
-    offset_min, offset_max, cap_min, cap_max.
+    Handles two formats:
+
+    Active:
+        power1_cap_w=210 (min=210 default=300 max=330)
+        vddgfx_offset_mv=-25 (range -200..0)
+
+    Suspended:
+        runtime_status=suspended
+        sensors=skipped (not active; refusing to wake)
+        cached_ranges: cap=210..330 W (default=300) vo=-200..0 mV (age=22s)
+
+    Returns a dict that may contain:
+        offset_mv, cap_w, offset_min, offset_max, cap_min, cap_max, suspended
     """
     info: dict = {}
-    m = re.search(r"offset.*?(-?\d+)\s*mV", stdout, re.I)
-    if m:
-        info["offset_mv"] = int(m.group(1))
-    m = re.search(r"cap.*?(\d+)\s*W", stdout, re.I)
+
+    # Detect suspended state
+    if re.search(r"runtime_status\s*=\s*suspended", stdout, re.I):
+        info["suspended"] = True
+
+    # ── Active format: current values + ranges ──
+    # power1_cap_w=210 (min=210 default=300 max=330)
+    m = re.search(
+        r"power1_cap_w\s*=\s*(\d+)\s*\(min=(\d+)\s+default=\d+\s+max=(\d+)\)",
+        stdout,
+    )
     if m:
         info["cap_w"] = int(m.group(1))
-    # Offset range: "range: -200..0" or "-200 – 0"
-    m = re.search(r"offset.*?(-?\d+)\s*[–\-]\s*(-?\d+)", stdout, re.I)
-    if not m:
-        m = re.search(r"offset.*?range.*?(-?\d+)\.\.(-?\d+)", stdout, re.I)
+        info["cap_min"] = int(m.group(2))
+        info["cap_max"] = int(m.group(3))
+
+    # vddgfx_offset_mv=-25 (range -200..0)
+    m = re.search(
+        r"vddgfx_offset_mv\s*=\s*(-?\d+)\s*\(range\s+(-?\d+)\.\.(-?\d+)\)",
+        stdout,
+    )
     if m:
-        info["offset_min"] = int(m.group(1))
-        info["offset_max"] = int(m.group(2))
-    # Cap range
-    m = re.search(r"cap.*?(\d+)\s*[–\-]\s*(\d+)", stdout, re.I)
-    if not m:
-        m = re.search(r"cap.*?range.*?(\d+)\.\.(\d+)", stdout, re.I)
+        info["offset_mv"] = int(m.group(1))
+        info["offset_min"] = int(m.group(2))
+        info["offset_max"] = int(m.group(3))
+
+    # ── Suspended format: cached_ranges ──
+    # cached_ranges: cap=210..330 W (default=300) vo=-200..0 mV (age=22s)
+    m = re.search(
+        r"cached_ranges:\s*cap=(\d+)\.\.(\d+)\s*W.*?vo=(-?\d+)\.\.(-?\d+)\s*mV",
+        stdout,
+    )
     if m:
         info["cap_min"] = int(m.group(1))
         info["cap_max"] = int(m.group(2))
+        info["offset_min"] = int(m.group(3))
+        info["offset_max"] = int(m.group(4))
+
     return info
 
 
 def check_kernel_logs(since_iso: str) -> list[str]:
-    """Return dangerous kernel lines since *since_iso*, ignoring benign OD re-uploads."""
+    """Return dangerous kernel lines since *since_iso*, ignoring benign OD re-uploads.
+
+    Dangerous patterns are checked FIRST: a line matching both a dangerous
+    and a benign pattern is classified as dangerous (not skipped).
+    """
     rc, out, _ = run_cmd(["journalctl", "-k", "--since", since_iso, "--no-pager"], timeout=15)
     if rc != 0:
         return []  # journalctl unavailable; don't block on it
     dangerous = []
     for line in out.splitlines():
-        if any(p.search(line) for p in BENIGN_KERNEL):
-            continue
+        # Dangerous check takes priority over benign skip
         if any(p.search(line) for p in DANGEROUS_KERNEL):
             dangerous.append(line.strip())
+        elif any(p.search(line) for p in BENIGN_KERNEL):
+            continue  # benign-only line; skip
     return dangerous
 
 
@@ -257,6 +325,8 @@ def main():
                     help="print plan and commands, execute nothing")
     ap.add_argument("--allow-below-100", action="store_true",
                     help="permit offsets below -100 mV")
+    ap.add_argument("--allow-missing-baseline", action="store_true",
+                    help="do not fail gate if bench JSON is missing")
     ap.add_argument("--report", action="store_true",
                     help="print matrix.csv as sorted table and exit")
     ap.add_argument("--bench", default=BENCH_DEFAULT,
@@ -288,12 +358,31 @@ def main():
         if off < -100 and not args.allow_below_100:
             sys.exit(f"error: offset {off} mV below -100; use --allow-below-100 to override")
 
+    # ── Read config for safe point (authoritative restore target) ──
+    cfg = read_config()
+    safe_offset = cfg.get("offset_mv", 0)
+    safe_cap = cfg.get("cap_w", 210)
+    if "offset_mv" not in cfg or "cap_w" not in cfg:
+        print(f"  WARNING: could not read full config from {CONF_PATH}; "
+              f"safe point defaults to offset={safe_offset} mV, cap={safe_cap} W",
+              file=sys.stderr)
+
     # ── Get live ranges from daemon ──
     rc, status_out, status_err = run_cmd([DAEMON, "status"], timeout=15)
     if rc != 0:
         sys.exit(f"error: r9700-tunerd status failed (rc={rc}): {status_err.strip()}")
     live = parse_status(status_out)
-    print(f"Live: offset={live.get('offset_mv', '?')} mV  cap={live.get('cap_w', '?')} W")
+
+    if live.get("suspended"):
+        print("GPU is suspended (D3cold). Using cached ranges; "
+              "current values from config.")
+        # When suspended, current values come from config, not status
+        live["offset_mv"] = safe_offset
+        live["cap_w"] = safe_cap
+    else:
+        print(f"Live: offset={live.get('offset_mv', '?')} mV  "
+              f"cap={live.get('cap_w', '?')} W")
+
     if "offset_min" in live:
         print(f"  offset range: {live['offset_min']}..{live['offset_max']} mV")
     if "cap_min" in live:
@@ -339,6 +428,7 @@ def main():
         print(f"  Repeats:   {args.repeats}")
         print(f"  Output:    {out_dir}")
         print(f"  Bench:     {args.bench}")
+        print(f"  Safe point (config): offset={safe_offset} mV, cap={safe_cap} W")
         print(f"{'─'*60}")
         for i, (off, cap, r) in enumerate(plan, 1):
             label = f"vo{off}_cap{cap}_r{r}"
@@ -354,9 +444,8 @@ def main():
     if not args.endpoint or not args.model:
         sys.exit("error: --endpoint and --model required for real run")
 
-    # ── Track safe point (last known-good offset/cap) ──
-    safe_offset = live.get("offset_mv", 0)
-    safe_cap = live.get("cap_w", 210)
+    # ── Safe point is the CONFIG values (not parsed status) ──
+    # This ensures a suspended card cannot produce a wrong restore target.
     first_gen_by_cap: dict[int, float] = {}  # cap → first step's gen tok/s
 
     try:
@@ -364,7 +453,7 @@ def main():
             label = f"vo{off}_cap{cap}_r{r}"
             print(f"\n[step {step_idx}/{len(plan)}] offset={off} mV  cap={cap} W  r={r}")
 
-            # (1) Record current safe point
+            # (1) Record current safe point (always config values)
             print(f"  safe point: offset={safe_offset} mV, cap={safe_cap} W")
 
             # (2) Apply via daemon CLI + (3) verify readback
@@ -399,6 +488,15 @@ def main():
                 except (json.JSONDecodeError, OSError) as e:
                     gate_failures.append(f"cannot read bench JSON: {e}")
 
+            # Gate 7: missing baseline (no bench JSON at all)
+            if bench_data is None and not args.allow_missing_baseline:
+                gate_failures.append(
+                    "missing baseline: no bench JSON found "
+                    "(use --allow-missing-baseline to override)")
+            elif bench_data is None and args.allow_missing_baseline:
+                print("  WARNING: missing baseline (bench JSON not found); "
+                      "continuing per --allow-missing-baseline", file=sys.stderr)
+
             if bench_data:
                 agg = bench_data.get("aggregates", {})
                 errors_list = bench_data.get("errors", [])
@@ -407,7 +505,8 @@ def main():
 
                 # Gate 2: zero harness errors
                 if len(errors_list) > 0:
-                    gate_failures.append(f"{len(errors_list)} harness error(s): {errors_list[:3]}")
+                    gate_failures.append(
+                        f"{len(errors_list)} harness error(s): {errors_list[:3]}")
 
                 # Gate 3: offset and cap reported stable
                 if not agg.get("offset_stable", True):
@@ -433,7 +532,8 @@ def main():
             # Gate 4: no dangerous kernel lines since step start
             dangerous = check_kernel_logs(step_start_iso)
             if dangerous:
-                gate_failures.append(f"{len(dangerous)} dangerous kernel line(s): {dangerous[:3]}")
+                gate_failures.append(
+                    f"{len(dangerous)} dangerous kernel line(s): {dangerous[:3]}")
 
             # ── Evaluate ──
             if gate_failures:
@@ -465,10 +565,6 @@ def main():
                             "errors": -1, "verdict": "NO_DATA"})
             append_row(out_dir, row)
             print(f"  ✓ PASS — row appended to {out_dir / MATRIX_CSV}")
-
-            # Update safe point (this step is now known-good)
-            safe_offset = off
-            safe_cap = cap
 
             # Wait for D3cold between steps (max 60 s)
             if step_idx < len(plan):

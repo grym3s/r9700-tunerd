@@ -31,6 +31,8 @@ DAEMON_CLI = "/usr/local/sbin/r9700-tunerd"
 BENCH_ENDPOINT = "http://127.0.0.1:1234/v1"
 BENCH_MODEL = "qwen/qwen3.8-27b@q4_k_m"
 
+MAX_BODY_BYTES = 65536
+
 TOKEN = ""
 GPU = None
 CONFIG = {}
@@ -125,6 +127,70 @@ class GpuSysfs:
         return self._read(self.hwmon / name)
 
 
+# ─── Adaptive sensor sampling state ─────────────────────────────────────────
+# Prevents the SSE loop from re-arming the amdgpu 5 s autosuspend timer on
+# every 2 s poll.  PM-safe fields are still read every tick; the heavier
+# hwmon/OD/clock block is read only when a "sensor slot" is due.
+#   • busy mode (last gpu_busy >= 5):  slot = 2 s
+#   • idle mode (last gpu_busy < 5):   slot = 9 s  (> 5 s autosuspend)
+#   • after suspend→wake:             first slot is immediate (2 s mode)
+
+class _SamplingState:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._last_read = None       # monotonic ts of last sensor read
+        self._last_busy = None       # last observed gpu_busy_percent
+        self._last_block = None      # last successful sensor dict
+        self._prev_status = None     # previous tick's runtime_status
+        self._force_busy = False     # one-shot: force 2 s mode after wake
+
+    def tick(self, now, runtime_status):
+        """Decide whether to read sensors this tick.
+
+        Returns (mode, next_read_s, should_read, cached_block, age_s).
+        """
+        with self._lock:
+            # Detect active → non-active transition (suspend).
+            if runtime_status != "active" and self._prev_status == "active":
+                self._last_read = None
+                self._last_busy = None
+                self._force_busy = True  # next wake samples immediately
+            self._prev_status = runtime_status
+
+            if runtime_status != "active":
+                age = (now - self._last_read) if self._last_read is not None else None
+                return ("asleep", 0.0, False, self._last_block, age)
+
+            # Active: pick interval.
+            if self._force_busy or (self._last_busy is not None and self._last_busy >= 5):
+                interval = 2.0
+            else:
+                interval = 9.0
+
+            if self._last_read is None or (now - self._last_read) >= interval:
+                mode = "busy" if (self._force_busy
+                                  or (self._last_busy is not None and self._last_busy >= 5)) \
+                       else "idle-backoff"
+                return (mode, 0.0, True, None, None)
+            else:
+                remaining = interval - (now - self._last_read)
+                mode = "busy" if (self._force_busy
+                                  or (self._last_busy is not None and self._last_busy >= 5)) \
+                       else "idle-backoff"
+                age = now - self._last_read
+                return (mode, remaining, False, self._last_block, age)
+
+    def record_read(self, now, block, gpu_busy):
+        with self._lock:
+            self._last_read = now
+            self._last_block = block
+            self._last_busy = gpu_busy
+            self._force_busy = False  # consume the one-shot flag
+
+
+_SAMPLING = _SamplingState()
+
+
 # ─── Parsers ─────────────────────────────────────────────────────────────────
 
 def _parse_dpm_clock(text):
@@ -163,62 +229,80 @@ def _hwmon_w(name):
     return int(v) / 1_000_000 if v is not None else None
 
 
+# ─── Sensor block reader (extracted for adaptive sampling) ──────────────────
+
+def _read_sensors():
+    """Read the full sensor block.  Returns a dict (fields may be None on
+    individual EBUSY) or None if GPU is unavailable."""
+    if GPU is None:
+        return None
+    live = {}
+    od = GPU.read_active("pp_od_clk_voltage")
+    if od:
+        cur, vmin, vmax = _parse_od_vddgfx(od)
+        live["offset_mv"] = cur
+        live["vo_min_mv"] = vmin
+        live["vo_max_mv"] = vmax
+    else:
+        live["offset_mv"] = None
+        live["vo_min_mv"] = None
+        live["vo_max_mv"] = None
+    cap = GPU.read_hwmon("power1_cap")
+    live["cap_w"] = int(cap) / 1_000_000 if cap is not None else None
+    live["cap_min_w"] = _hwmon_w("power1_cap_min")
+    live["cap_max_w"] = _hwmon_w("power1_cap_max")
+    live["cap_default_w"] = _hwmon_w("power1_cap_default")
+    pw = GPU.read_hwmon("power1_average") or GPU.read_hwmon("power1_input")
+    live["power_w"] = int(pw) / 1_000_000 if pw is not None else None
+    for key, attr in [("edge_c", "temp1_input"),
+                      ("junction_c", "temp2_input"),
+                      ("mem_c", "temp3_input")]:
+        v = GPU.read_hwmon(attr)
+        live[key] = int(v) / 1000 if v is not None else None
+    v = GPU.read_hwmon("fan1_input")
+    live["fan_rpm"] = int(v) if v is not None else None
+    sclk = GPU.read_active("pp_dpm_sclk")
+    live["sclk_mhz"] = _parse_dpm_clock(sclk) if sclk else None
+    mclk = GPU.read_active("pp_dpm_mclk")
+    live["mclk_mhz"] = _parse_dpm_clock(mclk) if mclk else None
+    busy = GPU.read_active("gpu_busy_percent")
+    live["gpu_busy"] = int(busy) if busy is not None else None
+    return live
+
+
 # ─── Status payload ──────────────────────────────────────────────────────────
 
 def _build_status(include_journal=True):
     ts = datetime.now(timezone.utc).isoformat()
+    now = time.monotonic()
     pci = str(GPU.pci) if GPU else None
-    # Runtime-PM guard: these three reads are safe in any power state.
+
+    # PM-safe reads (safe in any power state — never wake the card).
     rs = GPU.runtime_status() if GPU else None
     ps = GPU.power_state() if GPU else None
     susp = GPU.runtime_suspended_time() if GPU else None
     suspended_ms = int(susp) if susp is not None else None
-    # power/control is a device-PM attribute; reading it never wakes the card.
     try:
         control = (Path(pci) / "power" / "control").read_text().strip()
     except OSError:
         control = None
 
+    # Adaptive sensor sampling.
+    mode, next_read_s, should_read, cached_block, age_s = _SAMPLING.tick(now, rs)
+
+    live = None
+    if should_read and rs == "active":
+        live = _read_sensors()
+        if live is not None:
+            _SAMPLING.record_read(now, live, live.get("gpu_busy"))
+            age_s = 0.0
+    elif cached_block is not None:
+        live = cached_block
+
     tuned = {
         "offset_mv": int(CONFIG.get("VOLTAGE_OFFSET_MV", "0")),
         "cap_w": int(CONFIG.get("POWER_LIMIT_W", "300")),
     }
-
-    # Live sensors — ONLY when active (runtime-PM guard: never touch hwmon/pp_*
-    # while suspended; EBUSY on individual reads → null field).
-    live = None
-    if rs == "active":
-        live = {}
-        od = GPU.read_active("pp_od_clk_voltage")
-        if od:
-            cur, vmin, vmax = _parse_od_vddgfx(od)
-            live["offset_mv"] = cur
-            live["vo_min_mv"] = vmin
-            live["vo_max_mv"] = vmax
-        else:
-            live["offset_mv"] = None
-            live["vo_min_mv"] = None
-            live["vo_max_mv"] = None
-        cap = GPU.read_hwmon("power1_cap")
-        live["cap_w"] = int(cap) / 1_000_000 if cap is not None else None
-        live["cap_min_w"] = _hwmon_w("power1_cap_min")
-        live["cap_max_w"] = _hwmon_w("power1_cap_max")
-        live["cap_default_w"] = _hwmon_w("power1_cap_default")
-        pw = GPU.read_hwmon("power1_average") or GPU.read_hwmon("power1_input")
-        live["power_w"] = int(pw) / 1_000_000 if pw is not None else None
-        for key, attr in [("edge_c", "temp1_input"),
-                          ("junction_c", "temp2_input"),
-                          ("mem_c", "temp3_input")]:
-            v = GPU.read_hwmon(attr)
-            live[key] = int(v) / 1000 if v is not None else None
-        v = GPU.read_hwmon("fan1_input")
-        live["fan_rpm"] = int(v) if v is not None else None
-        sclk = GPU.read_active("pp_dpm_sclk")
-        live["sclk_mhz"] = _parse_dpm_clock(sclk) if sclk else None
-        mclk = GPU.read_active("pp_dpm_mclk")
-        live["mclk_mhz"] = _parse_dpm_clock(mclk) if mclk else None
-        busy = GPU.read_active("gpu_busy_percent")
-        live["gpu_busy"] = int(busy) if busy is not None else None
 
     # Ranges: prefer live; fall back to daemon-written cache.
     ranges = {"source": None, "cap_min_w": None, "cap_max_w": None,
@@ -271,7 +355,11 @@ def _build_status(include_journal=True):
         "suspended_ms": suspended_ms, "control": control,
         "tuned": tuned, "live": live, "ranges": ranges,
         "service": svc, "state_file": state_text,
+        "sampling": {"mode": mode, "next_sensor_read_s": round(next_read_s, 2)},
     }
+    if live is not None:
+        payload["live_age_s"] = round(age_s, 2) if age_s is not None else 0.0
+
     if include_journal:
         try:
             r = subprocess.run(
@@ -333,10 +421,23 @@ class Handler(BaseHTTPRequestHandler):
         print(f"[{self.log_date_time_string()}] {self.address_string()} {fmt % args}",
               flush=True)
 
+    def log_request(self, code='-', size='-'):
+        """Override to log the path WITHOUT the query string (avoids leaking
+        the ?t=… token into access logs)."""
+        if hasattr(code, 'value'):
+            code = code.value
+        path = urllib.parse.urlparse(self.path).path
+        self.log_message('"%s %s %s" %s %s',
+                         self.command, path, self.request_version,
+                         str(code), str(size))
+
     def _auth_ok(self):
         q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
         tok = q.get("t", [None])[0] or self.headers.get("X-Token")
-        return tok is not None and tok == TOKEN
+        if tok is None or not TOKEN:
+            return False
+        # #6: constant-time comparison to prevent timing side-channel.
+        return secrets.compare_digest(tok.encode("utf-8"), TOKEN.encode("utf-8"))
 
     def _json(self, code, obj):
         body = json.dumps(obj).encode()
@@ -354,8 +455,21 @@ class Handler(BaseHTTPRequestHandler):
         if "application/json" not in ct:
             self._err(415, "Content-Type must be application/json")
             return None
+        # #5: refuse chunked bodies (cannot determine size up-front).
+        te = self.headers.get("Transfer-Encoding", "").lower()
+        if "chunked" in te:
+            self._err(400, "chunked Transfer-Encoding not supported")
+            return None
         try:
             length = int(self.headers.get("Content-Length", 0))
+        except (ValueError, TypeError):
+            self._err(400, "invalid or missing Content-Length")
+            return None
+        # #5: cap body at 64 KiB.
+        if length > MAX_BODY_BYTES:
+            self._err(413, f"request body too large (max {MAX_BODY_BYTES} bytes)")
+            return None
+        try:
             return json.loads(self.rfile.read(length))
         except (ValueError, json.JSONDecodeError):
             self._err(400, "invalid JSON body")
@@ -588,13 +702,17 @@ def main():
               file=sys.stderr)
 
     TOKEN = secrets.token_hex(16)
-    url = f"http://{args.host}:{args.port}/?t={TOKEN}"
-    print(url, flush=True)
+    # #4: print token on its own line; URL without the token in the log.
+    url_bare = f"http://{args.host}:{args.port}/"
+    url_auth = f"{url_bare}?t={TOKEN}"
+    print(f"TOKEN: {TOKEN}", flush=True)
+    print(url_bare, flush=True)
 
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     server.daemon_threads = True
     if args.open:
-        subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL,
+        # --open still passes the full authenticated URL to the browser.
+        subprocess.Popen(["xdg-open", url_auth], stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL)
     try:
         server.serve_forever()
