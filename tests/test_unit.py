@@ -1,0 +1,433 @@
+"""Unit tests for r9700-tunerd — no hardware, no root, no /sys access."""
+from __future__ import annotations
+
+import errno
+import os
+import syslog
+
+import pytest
+
+import rt  # loaded by conftest.py
+
+
+# ===================================================================
+# parse_od
+# ===================================================================
+
+
+def test_parse_od_normal():
+    text = "OD_VDDGFX_OFFSET:\n0mV\nOD_RANGE:\nVDDGFX_OFFSET: -200mV 0mV\n"
+    r = rt.parse_od(text)
+    assert r["current_mv"] == 0
+    assert r["min_mv"] == -200
+    assert r["max_mv"] == 0
+    assert r["raw"] == text
+
+
+def test_parse_od_missing_range():
+    text = "OD_VDDGFX_OFFSET:\n-25mV\n"
+    r = rt.parse_od(text)
+    assert r["current_mv"] == -25
+    assert r["min_mv"] is None
+    assert r["max_mv"] is None
+
+
+def test_parse_od_empty():
+    r = rt.parse_od("")
+    assert r["current_mv"] is None
+    assert r["min_mv"] is None
+    assert r["max_mv"] is None
+
+
+# ===================================================================
+# load_conf
+# ===================================================================
+
+
+def test_load_conf_defaults(tmp_path):
+    p = tmp_path / "does_not_exist.conf"
+    result = rt.load_conf(p)
+    assert result == rt.DEFAULTS
+
+
+def test_load_conf_overrides_and_comments(tmp_path):
+    p = tmp_path / "test.conf"
+    p.write_text(
+        "# full-line comment\n"
+        "VOLTAGE_OFFSET_MV=-25  # inline comment\n"
+        "POWER_LIMIT_W=250\n"
+        "\n"
+        "   \n"
+    )
+    result = rt.load_conf(p)
+    assert result["VOLTAGE_OFFSET_MV"] == "-25"
+    assert result["POWER_LIMIT_W"] == "250"
+    # Unset keys retain defaults
+    assert result["VENDOR"] == "0x1002"
+    assert result["DEVICE"] == "0x7551"
+
+
+# ===================================================================
+# validate_conf
+# ===================================================================
+
+
+def test_validate_conf_ok():
+    raw = dict(rt.DEFAULTS)
+    parsed, problems = rt.validate_conf(raw)
+    assert problems == []
+    assert parsed["VENDOR"] == "0x1002"
+    assert parsed["DEVICE"] == "0x7551"
+    assert parsed["POWER_LIMIT_W"] == 210
+    assert parsed["VOLTAGE_OFFSET_MV"] == 0
+    assert parsed["POLL_INTERVAL_S"] == 2.0
+
+
+def test_validate_conf_bad_offset():
+    raw = dict(rt.DEFAULTS)
+    raw["VOLTAGE_OFFSET_MV"] = "100"  # positive → out of range -500..0
+    parsed, problems = rt.validate_conf(raw)
+    assert any("VOLTAGE_OFFSET_MV" in p for p in problems)
+    assert parsed["VOLTAGE_OFFSET_MV"] is None
+
+
+def test_validate_conf_out_of_range_cap():
+    raw = dict(rt.DEFAULTS)
+    raw["POWER_LIMIT_W"] = "5"  # below 50
+    parsed, problems = rt.validate_conf(raw)
+    assert any("POWER_LIMIT_W" in p for p in problems)
+    assert parsed["POWER_LIMIT_W"] is None
+
+
+def test_validate_conf_unknown_key_is_warning_only():
+    raw = dict(rt.DEFAULTS)
+    raw["MY_CUSTOM_KEY"] = "hello"
+    parsed, problems = rt.validate_conf(raw)
+    assert any("unknown key" in p for p in problems)
+    # All known keys still validate correctly
+    assert parsed["VENDOR"] == "0x1002"
+    assert parsed["POWER_LIMIT_W"] == 210
+    assert parsed["VOLTAGE_OFFSET_MV"] == 0
+
+
+def test_validate_conf_bad_hex_identity():
+    raw = dict(rt.DEFAULTS)
+    raw["VENDOR"] = "0x12345"  # five hex digits, not four
+    parsed, problems = rt.validate_conf(raw)
+    assert any("VENDOR" in p for p in problems)
+    assert parsed["VENDOR"] is None
+
+
+# ===================================================================
+# discover
+# ===================================================================
+
+
+def test_discover_one_match(fake_tree, conf):
+    result = rt.discover(conf)
+    assert result is not None
+    assert result.name == "0000:aa:00.0"
+
+
+def test_discover_zero_match_required_exits(fake_tree, conf, log_recorder):
+    conf["VENDOR"] = "0x9999"  # no device matches
+    with pytest.raises(SystemExit):
+        rt.discover(conf, required=True)
+
+
+def test_discover_two_matches_returns_none(fake_tree, conf):
+    # Create a duplicate R9700 so two devices share the same identity.
+    dup = fake_tree / "0000:cc:00.0"
+    dup.mkdir()
+    (dup / "vendor").write_text("0x1002\n")
+    (dup / "device").write_text("0x7551\n")
+    (dup / "subsystem_vendor").write_text("0x1043\n")
+    (dup / "subsystem_device").write_text("0x0626\n")
+    result = rt.discover(conf, required=False)
+    assert result is None
+
+
+# ===================================================================
+# od_attempts
+# ===================================================================
+
+
+def test_od_attempts_first_try(fake_tree, conf):
+    pci = fake_tree / "0000:aa:00.0"
+    calls: list[int] = []
+
+    def fn():
+        calls.append(1)
+        return "ok"
+
+    result = rt.od_attempts(pci, fn, settle=True)
+    assert result == "ok"
+    assert len(calls) == 1
+
+
+def test_od_attempts_transient_then_success(fake_tree, conf):
+    pci = fake_tree / "0000:aa:00.0"
+    calls: list[int] = []
+
+    def fn():
+        calls.append(1)
+        if len(calls) <= 2:
+            raise OSError(errno.EBUSY, "Device or resource busy")
+        return "ok"
+
+    result = rt.od_attempts(pci, fn, settle=True)
+    assert result == "ok"
+    assert len(calls) == 3  # two EBUSY + one success
+
+
+def test_od_attempts_exhausted_raises(fake_tree, conf):
+    pci = fake_tree / "0000:aa:00.0"
+    calls: list[int] = []
+
+    def fn():
+        calls.append(1)
+        raise OSError(errno.EBUSY, "Device or resource busy")
+
+    with pytest.raises(OSError) as exc_info:
+        rt.od_attempts(pci, fn, settle=True)
+    assert exc_info.value.errno == errno.EBUSY
+    assert len(calls) == 4  # 1 initial + 3 retries
+
+
+def test_od_attempts_non_transient_reraises(fake_tree, conf):
+    pci = fake_tree / "0000:aa:00.0"
+    calls: list[int] = []
+
+    def fn():
+        calls.append(1)
+        raise ValueError("not a transient error")
+
+    with pytest.raises(ValueError, match="not a transient error"):
+        rt.od_attempts(pci, fn, settle=True)
+    assert len(calls) == 1  # no retry for non-transient
+
+
+def test_od_attempts_inactive_raises(fake_tree, conf):
+    pci = fake_tree / "0000:aa:00.0"
+    # Flip runtime_status to suspended
+    (pci / "power" / "runtime_status").write_text("suspended\n")
+    with pytest.raises(RuntimeError, match="runtime_status"):
+        rt.od_attempts(pci, lambda: "ok", settle=True)
+
+
+# ===================================================================
+# restore_voltage
+# ===================================================================
+
+
+def test_restore_voltage_refuses_without_range(fake_tree, conf):
+    pci = fake_tree / "0000:aa:00.0"
+    # OD text with no OD_RANGE section
+    (pci / "pp_od_clk_voltage").write_text("OD_VDDGFX_OFFSET:\n0mV\n")
+    conf["VOLTAGE_OFFSET_MV"] = -25
+    with pytest.raises(RuntimeError, match="OD_RANGE"):
+        rt.restore_voltage(pci, conf)
+
+
+def test_restore_voltage_out_of_range(fake_tree, conf):
+    pci = fake_tree / "0000:aa:00.0"
+    # Range is -200..0; request -300
+    conf["VOLTAGE_OFFSET_MV"] = -300
+    with pytest.raises(RuntimeError, match="outside live range"):
+        rt.restore_voltage(pci, conf)
+
+
+def test_restore_voltage_writes_vo_then_commit(fake_tree, conf, monkeypatch):
+    pci = fake_tree / "0000:aa:00.0"
+    od_path = pci / "pp_od_clk_voltage"
+    # Initial state: offset at 0 mV
+    od_path.write_text(
+        "OD_VDDGFX_OFFSET:\n0mV\nOD_RANGE:\nVDDGFX_OFFSET: -200mV 0mV\n"
+    )
+    conf["VOLTAGE_OFFSET_MV"] = -25
+
+    writes: list[tuple[str, str]] = []
+
+    def fake_write_text(path, value):
+        writes.append((str(path), value))
+        # Simulate sysfs: "vo -25" updates the reported offset
+        if "pp_od_clk_voltage" in str(path) and value == "vo -25\n":
+            od_path.write_text(
+                "OD_VDDGFX_OFFSET:\n-25mV\nOD_RANGE:\nVDDGFX_OFFSET: -200mV 0mV\n"
+            )
+
+    monkeypatch.setattr(rt, "write_text", fake_write_text)
+
+    result = rt.restore_voltage(pci, conf)
+    assert result == "restored -25"
+
+    # Only the two OD writes should appear
+    vo_writes = [v for p, v in writes if "pp_od_clk_voltage" in p]
+    assert vo_writes == ["vo -25\n", "c\n"]
+
+
+# ===================================================================
+# require_runtime_pm / handle_wake guards
+# ===================================================================
+
+
+def test_require_runtime_pm_refuses_control_on(fake_tree):
+    igpu = fake_tree / "0000:bb:00.0"
+    with pytest.raises(RuntimeError, match="control=on"):
+        rt.require_runtime_pm(igpu)
+
+
+def test_handle_wake_skips_when_control_on(
+    fake_tree, conf, log_recorder, monkeypatch
+):
+    igpu = fake_tree / "0000:bb:00.0"
+    rt._runtime_pm_warned = False
+
+    writes: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        rt, "write_text", lambda p, v: writes.append((str(p), v))
+    )
+
+    result = rt.handle_wake(igpu, conf, False)
+    assert result is False  # cap_checked unchanged
+    assert len(writes) == 0  # no sysfs writes
+
+    warnings = [msg for level, msg in log_recorder if level == syslog.LOG_WARNING]
+    assert len(warnings) == 1
+    assert "control=on" in warnings[0]
+
+
+def test_handle_wake_restores_offset(
+    fake_tree, conf, log_recorder, monkeypatch
+):
+    pci = fake_tree / "0000:aa:00.0"
+    od_path = pci / "pp_od_clk_voltage"
+    od_path.write_text(
+        "OD_VDDGFX_OFFSET:\n0mV\nOD_RANGE:\nVDDGFX_OFFSET: -200mV 0mV\n"
+    )
+    conf["VOLTAGE_OFFSET_MV"] = -25
+    rt._runtime_pm_warned = False
+    rt._last_kernel_scan = 0.0
+
+    writes: list[tuple[str, str]] = []
+
+    def fake_write_text(path, value):
+        writes.append((str(path), value))
+        if "pp_od_clk_voltage" in str(path) and value == "vo -25\n":
+            od_path.write_text(
+                "OD_VDDGFX_OFFSET:\n-25mV\nOD_RANGE:\nVDDGFX_OFFSET: -200mV 0mV\n"
+            )
+
+    monkeypatch.setattr(rt, "write_text", fake_write_text)
+
+    result = rt.handle_wake(pci, conf, False)
+    assert result is True  # cap_checked set to True
+
+    vo_writes = [v for p, v in writes if "pp_od_clk_voltage" in p]
+    assert "vo -25\n" in vo_writes
+    assert "c\n" in vo_writes
+
+    all_msgs = [msg for _, msg in log_recorder]
+    assert any("VDDGFX offset restored" in m for m in all_msgs)
+
+
+# ===================================================================
+# _atomic_write / set_conf_value
+# ===================================================================
+
+
+def test_atomic_write_replaces_and_keeps_mode(tmp_path):
+    p = tmp_path / "target"
+    p.write_text("original content")
+    os.chmod(p, 0o640)
+
+    rt._atomic_write(p, b"replaced content")
+
+    assert p.read_text(encoding="utf-8") == "replaced content"
+    assert p.stat().st_mode & 0o777 == 0o640
+
+
+def test_set_conf_value_updates_or_appends(tmp_path):
+    p = tmp_path / "test.conf"
+    p.write_text("VENDOR=0x1002\nPOWER_LIMIT_W=210\n")
+
+    # Update an existing key
+    rt.set_conf_value(p, "POWER_LIMIT_W", "250")
+    text = p.read_text(encoding="utf-8")
+    assert "POWER_LIMIT_W=250" in text
+    assert "POWER_LIMIT_W=210" not in text
+    assert "VENDOR=0x1002" in text
+
+    # Append a new key
+    rt.set_conf_value(p, "VOLTAGE_OFFSET_MV", "-25")
+    text = p.read_text(encoding="utf-8")
+    assert "VOLTAGE_OFFSET_MV=-25" in text
+    assert "VENDOR=0x1002" in text
+
+
+# ===================================================================
+# _stderr_is_journal
+# ===================================================================
+
+
+def test_stderr_is_journal_false_without_env(monkeypatch):
+    monkeypatch.delenv("JOURNAL_STREAM", raising=False)
+    assert rt._stderr_is_journal() is False
+
+
+# ===================================================================
+# cmd_watch — config reload resilience
+# ===================================================================
+
+
+def test_watch_loop_keeps_last_good_config(
+    fake_tree, conf, log_recorder, monkeypatch, tmp_path
+):
+    """Drive cmd_watch for a few iterations; corrupt the config mid-run.
+
+    Expect exactly one 'config reload failed' warning and a clean exit.
+    """
+    # --- Config file the watcher will reload each iteration -------------
+    conf_file = tmp_path / "watch.conf"
+    conf_file.write_text(
+        "VENDOR=0x1002\n"
+        "DEVICE=0x7551\n"
+        "SUBSYSTEM_VENDOR=0x1043\n"
+        "SUBSYSTEM_DEVICE=0x0626\n"
+        "POWER_LIMIT_W=210\n"
+        "VOLTAGE_OFFSET_MV=0\n"
+        "POLL_INTERVAL_S=2\n"
+    )
+    monkeypatch.setattr(rt, "CONF_PATH", conf_file)
+
+    # Reset module-level state
+    rt._stop = False
+    rt._runtime_pm_warned = False
+    rt._last_kernel_scan = 0.0
+
+    # --- Instrument time.sleep ------------------------------------------
+    # Call 1: od_attempts settle inside initial handle_wake (value 0)
+    # Call 2: end of 1st loop iteration  → corrupt config
+    # Call 3: end of 2nd loop iteration  → stop the watcher
+    sleep_count = 0
+
+    def fake_sleep(*args, **kwargs):
+        nonlocal sleep_count
+        sleep_count += 1
+        if sleep_count == 2:
+            # Make the config invalid (VOLTAGE_OFFSET_MV out of range)
+            conf_file.write_text("VOLTAGE_OFFSET_MV=999\n")
+        elif sleep_count == 3:
+            rt._stop = True
+
+    monkeypatch.setattr(rt.time, "sleep", fake_sleep)
+
+    # --- Run -------------------------------------------------------------
+    result = rt.cmd_watch(conf)
+    assert result == 0  # clean exit, not sys.exit
+
+    # Exactly one "config reload failed" warning (deduplicated by last_warn_text)
+    reload_warnings = [
+        msg for level, msg in log_recorder if "config reload failed" in msg
+    ]
+    assert len(reload_warnings) == 1
