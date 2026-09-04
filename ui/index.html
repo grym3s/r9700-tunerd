@@ -226,7 +226,7 @@ pre.log{margin:0;font-family:var(--mono);font-size:12px;color:#b9c4cf;background
     if (smp.mode === 'idle-backoff') {
       $('tracehint').textContent = `(card idle: sensors sampled every ~9 s so it can sleep; last read ${s.live_age_s!=null?Math.round(s.live_age_s):'?'} s ago)`;
     } else if (smp.mode === 'busy') {
-      $('tracehint').textContent = '(workload running: sampling every 2 s)';
+      $('tracehint').textContent = '(workload running: sampling every 0.5 s)';
     } else {
       $('tracehint').textContent = '(samples only while the card is awake)';
     }

@@ -300,7 +300,7 @@ class TestStatusPayload:
 
 class TestAdaptiveSampling:
     def test_busy_mode_after_high_busy(self, fake_ui_tree):
-        """After recording gpu_busy=97, subsequent ticks use 2 s interval (busy)."""
+        """After recording gpu_busy=97, subsequent ticks use the 0.5 s busy interval."""
         s = ui_mod._SamplingState()
         t0 = 1000.0
 
@@ -310,14 +310,14 @@ class TestAdaptiveSampling:
         # Record the read with high busy
         s.record_read(t0, {"gpu_busy": 97}, 97)
 
-        # Second tick 1 s later: busy interval is 2 s, so NOT due yet
-        mode, next_s, should_read, _, _ = s.tick(t0 + 1.0, "active")
+        # Second tick 0.2 s later: busy interval is 0.5 s, so NOT due yet
+        mode, next_s, should_read, _, _ = s.tick(t0 + 0.2, "active")
         assert mode == "busy"
         assert should_read is False
-        assert next_s == pytest.approx(1.0, abs=0.01)
+        assert next_s == pytest.approx(0.3, abs=0.01)
 
-        # Third tick 3 s after first: beyond 2 s interval → read again
-        mode, _, should_read, _, _ = s.tick(t0 + 3.0, "active")
+        # Third tick 0.6 s after first: beyond 0.5 s interval → read again
+        mode, _, should_read, _, _ = s.tick(t0 + 0.6, "active")
         assert mode == "busy"
         assert should_read is True
 

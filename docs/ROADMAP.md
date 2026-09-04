@@ -26,5 +26,8 @@ validated on the live card.
    `status --json` and a small local IPC (unix socket) so the UI never touches
    sysfs itself and never holds the card awake; (b) profiles from Phase 4 data.
    Not before Phases 2–4 are accepted.
-6. **Later** – clock tuning, hybrid active-load fan controller (only if proven
-   runtime-PM-safe), multi-GPU support beyond the R9700.
+6. **Custom fan curve** (owner request 2026-09-04; see handoff/HANDOFF.md §10 item 6)
+   – active-only controller with firmware fallback on every exit path, curve
+   editor in the app writing through the daemon CLI. Must pass the dashboard
+   hazard test with the controller enabled.
+7. **Later** – clock tuning, multi-GPU support beyond the R9700.

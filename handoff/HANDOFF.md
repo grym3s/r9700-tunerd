@@ -347,6 +347,32 @@ document, labelled WIP for the app.
 4. Longer soak at -50 mV / 210 W under the owner's real workload.
 5. UI follow-ups from the roadmap: matrix results view, profile editor,
    tray/launcher integration.
-6. Phase D fan control only when proven runtime-PM-safe.
-7. Add an OpenRouter/Anthropic key to `~/.hermes/.env` and the Forge/Vale
+6. **Custom fan curve (owner request, 2026-09-04).** The owner wants to set
+   a custom fan curve from the app. Constraints that must hold, from the
+   hardware notes and the daemon's design:
+   - Active-only state machine. Fan control means writing `pwm1_enable=1`
+     and `pwm1` in hwmon, and reading temperatures to drive it; every one
+     of those reads/writes takes a PM reference. So the controller may run
+     only while the card is already active (busy mode of the sampler), must
+     hand control back to firmware (`pwm1_enable=2`) before the card is
+     allowed to idle, and must never be the thing that keeps it awake. The
+     daemon already has the wake/suspend edge detection to drive this.
+   - Firmware fallback on every exit path: watcher stop, crash, config
+     typo, SIGKILL. A udev/oneshot or the watcher's own startup must reset
+     `pwm1_enable=2` if it finds it at 1 with no live controller.
+   - Curve points validated against `pwm1_min/max` and `temp*_crit`; the
+     config placeholder `FAN_POINT_n=temp:pct` and hysteresis keys already
+     exist commented out in `/etc/r9700-tunerd.conf`.
+   - UI: a curve editor (draggable points over the live junction-temperature
+     trace) that only writes through the daemon CLI (`set-fan-curve`),
+     with a "firmware auto" button. Vale designs it; Ray/Halo build it;
+     Halo reviews the PM-safety.
+   - Acceptance: the dashboard hazard test still passes with the controller
+     enabled (card reaches D3cold within ~20 s of idle), and a reboot check.
+   Not started. Do not enable any fan write path until the above is
+   implemented and reviewed.
+7. Owner feedback 2026-09-04: the live trace felt too slow. Shipped in
+   the same session: busy-mode sampling and SSE ticks at 0.5 s (was 2 s),
+   idle back-off unchanged at 9 s so an idle card still sleeps.
+8. Add an OpenRouter/Anthropic key to `~/.hermes/.env` and the Forge/Vale
    profile `.env` files if the cloud agents are to be used (see `AGENTS.md`).

@@ -131,9 +131,12 @@ class GpuSysfs:
 # Prevents the SSE loop from re-arming the amdgpu 5 s autosuspend timer on
 # every 2 s poll.  PM-safe fields are still read every tick; the heavier
 # hwmon/OD/clock block is read only when a "sensor slot" is due.
-#   • busy mode (last gpu_busy >= 5):  slot = 2 s
+#   • busy mode (last gpu_busy >= 5):  slot = 0.5 s (card is working anyway;
+#                                       fast trace is free while it is busy)
 #   • idle mode (last gpu_busy < 5):   slot = 9 s  (> 5 s autosuspend)
-#   • after suspend→wake:             first slot is immediate (2 s mode)
+#   • after suspend→wake:             first slot is immediate (busy mode)
+BUSY_INTERVAL_S = 0.5
+IDLE_INTERVAL_S = 9.0
 
 class _SamplingState:
     def __init__(self):
@@ -163,9 +166,9 @@ class _SamplingState:
 
             # Active: pick interval.
             if self._force_busy or (self._last_busy is not None and self._last_busy >= 5):
-                interval = 2.0
+                interval = BUSY_INTERVAL_S
             else:
-                interval = 9.0
+                interval = IDLE_INTERVAL_S
 
             if self._last_read is None or (now - self._last_read) >= interval:
                 mode = "busy" if (self._force_busy
@@ -536,7 +539,8 @@ class Handler(BaseHTTPRequestHandler):
                     self.wfile.write(b": keepalive\n\n")
                     self.wfile.flush()
                     last_ka = time.monotonic()
-                time.sleep(2)
+                # Fast ticks only while the card is busy; 2 s otherwise (asleep or idle).
+                time.sleep(BUSY_INTERVAL_S if (payload.get("sampling") or {}).get("mode") == "busy" else 2)
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass  # client disconnected
 
