@@ -46,11 +46,18 @@ kept the card awake.
 
 - `discover` – locate the R9700 by identity, print sysfs path, runtime status, DRM names.
 - `status` – identity + runtime status; sensors/OD only if active (refuses to wake).
+  When EVICT_GUARD=1 (default), also prints `evict_guard=<label> vram_used=XG gtt_total=YG margin=Z`
+  where `<label>` is `off` (if guard disabled), `idle` (guard enabled, VRAM below threshold), or
+  `holding` (guard holding the card awake). Safe to run while the card is asleep: never reads
+  mem_info_*, hwmon, or power sensors; reads only fdinfo (process-owned VRAM), cached state, and MemTotal.
 - `apply` – explicit full apply: power cap (validated against `power1_cap_min/max`)
   then VDDGFX offset (validated against `OD_RANGE`), with read-back.
 - `watch` – the daemon (below).
 - `reset` – restore `power1_cap_default` and reset the OD table (`r` then `c`).
 - `set-undervolt MV` – write `VOLTAGE_OFFSET_MV` to the config, then `apply`.
+- `release-hold` – release a stale eviction-guard hold (e.g. left by a crashed daemon).
+  Reads power/control and the state file; releases only if both indicate a hold was set.
+  Otherwise it is a no-op. Logs the decision and any hold released or reason it was not released.
 - `probe-poll` – prove that polling `runtime_status` does not wake the GPU.
 
 ## Watcher state machine (`cmd_watch`, `handle_wake`)
@@ -118,8 +125,16 @@ State transitions are ACTIVE_CONFIGURED (normal, no hold) -> ACTIVE_HELD (guard 
 -> ACTIVE_CONFIGURED (released). The state file records vram_used and gtt_total when held.
 
 On daemon startup, if the daemon finds power/control="on" with state=ACTIVE_HELD, it
-adopts the hold. Otherwise, it leaves power/control untouched. On SIGTERM or loop exit,
-any hold is released.
+adopts the hold. This preserves a hold set by another instance (e.g. one that crashed).
+If power/control="on" but state is NOT ACTIVE_HELD, the daemon warns and writes nothing
+to power/control — it never releases a hold that someone else set. On SIGTERM or loop exit,
+any hold the daemon is holding is released by writing "auto" to power/control (never "off").
+
+The `release-hold` subcommand manually releases a stale hold left by a crashed daemon. It
+reads the state file and releases only if power/control="on" and state=ACTIVE_HELD; otherwise
+it is a no-op and logs which condition was not met. Wired as ExecStopPost in the systemd unit,
+it runs even if the daemon is killed uncleanly, guaranteeing the card cannot be held awake
+forever.
 
 ## Out of scope for now
 

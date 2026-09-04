@@ -125,4 +125,21 @@ Prerequisite: GPU VRAM is available and not in use by another process.
 9. Wait a few seconds and re-check: `r9700-tunerd status` should show `runtime_status=suspended`
    (GPU back to sleep).
 10. Check power/control again: should return to "auto" (runtime PM re-enabled).
-11. Stop daemon: `sudo systemctl stop r9700-tunerd`. Verify no errors in journalctl.
+11. Stop daemon and verify hold is released:
+
+    sudo systemctl stop r9700-tunerd
+    
+    Check daemon logs: should see "evict-guard: released hold on shutdown".
+    Query the PCI device path via `r9700-tunerd discover`, extract the PCI device path,
+    and read power/control: should show "auto" (hold released).
+
+12. Crash path test (unclean daemon death):
+
+    Prerequisite: GPU VRAM is available and a large model is loaded (to trigger the hold).
+    
+    1. Load a large GPU model again.
+    2. Verify the hold is active: `r9700-tunerd status` shows `holding`, power/control shows "on".
+    3. Kill the daemon process uncleanly (SIGKILL): `sudo killall -9 r9700-tunerd`.
+    4. Systemd's ExecStopPost runs `release-hold` automatically, releasing the hold.
+    5. Check daemon logs: should see "evict-guard: released stale hold" from the release-hold call.
+    6. Query power/control again: should show "auto" (ExecStopPost guaranteed the release).
