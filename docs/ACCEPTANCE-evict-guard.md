@@ -48,11 +48,28 @@ hangs, or OOM lines (only the known OD upload warnings).
 | card stays awake for the whole hold (dwell ≥ 30 s) | PASS | 135 s, D0 throughout |
 | release logged after unload | PASS | 17:22:29, VRAM 0.2G < 72 % |
 | `power/control=auto` after release | PASS | +2 s |
-| D3cold within ~20 s of release | **PENDING** | card still active with `control=auto` at 17:24; `renderD128` held by Mission Center (`missioncenter-magpie`), a Battle.net `gpu-process`, and LM Studio's GPU zygote. Mission Center is the documented wake/hold culprit (HANDOFF.md §5a). Re-measure with it closed. |
+| D3cold within ~20 s of release | PASS (second run) | first run: card stayed active after release because Mission Center was open (documented hold culprit, HANDOFF.md §5a) **and** the orchestrator's own sampler called `r9700-tunerd status` every second, whose sensor reads re-arm autosuspend; D3cold came 17:30:00, ~30 s after both were removed. Clean second run (17:32–17:33, sysfs-only timing, table below): `control=auto` +0.8 s, D3cold +7.1 s after `lms unload --all`. |
 | `r9700-tunerd status` shows `evict_guard=holding` | **FAIL** | printed `evict_guard=idle vram_used=0.0G` at 17:20:42 while holding. Defect 2 on kanban `t_35c35fc7`. |
 | dashboard shows the held-awake pill | **FAIL (expected)** | `/api/status` had `control=on`, `runtime_status=active` but `daemon_state`/`eviction_risk` null: the runtime state dir is gone (Defect 1, `t_35c35fc7`), and main's dashboard has no held-awake pill yet (R0.1 branch `wt/r01-ui-evict-pill`, card `t_4cf3bb0b`). |
 | zero kernel faults | PASS | see above |
-| `cycles` / `storm` after the run | PENDING | need an idle card (Mission Center closed) |
+| `cycles --count 5` after the run (17:30) | PASS | restore latency 0.5–2.2 s, -50 mV held, cap 210 W, D3cold 6.0–6.5 s every cycle, 5 journal wakes, 0 cap writes |
+| `storm` after the run (17:31) | PASS | 10/10 real wakes detected, watcher PID stable, no traceback, 0 kernel errors, D3cold 7.8 s |
+
+## Second hold/release run (clean timing, 17:32–17:33)
+
+Halo stopped, LM Studio server started, no sampler or status calls; only
+`power/control`, `power/runtime_status` and `power_state` were read.
+
+| Time | Event |
+|---|---|
+| 17:32:50.6 | JIT request sent |
+| 17:32:53 | `evict-guard: holding dGPU awake — VRAM 15.8G > 90% of GTT 16.6G` (while the model was still loading) |
+| 17:33:16 | model resident, reply HTTP 200; `control=on`, `runtime_status=active` |
+| 17:33:31.2 | `lms unload --all` |
+| 17:33:32 | `evict-guard: released hold — VRAM 0.0G < 72% of GTT 16.6G`; `control=auto` at +0.8 s |
+| 17:33:38.8 | `runtime_status=suspended`, `power_state=D3cold` at +7.1 s |
+
+LM Studio server stopped and Halo's server restarted afterwards.
 
 ## Defects found
 
@@ -89,7 +106,13 @@ handoff recorded this afternoon; the cold shutdown restores Gen4 only until the
 first D3cold exit. The 2.5 GT/s reading while suspended is the idle link state,
 not a degradation. Internal links `c6:00.0`/`c7:00.0` stay 32 GT/s x16.
 
-Verdict so far: the hold and release paths work on the live card within one
-poll, with no faults. Acceptance is incomplete until the D3cold-after-release
-timing and the cycles/storm battery are measured with Mission Center closed,
-and the two defects are fixed and re-verified.
+## Verdict (orchestrator; Forge signs off on kanban `t_7fc5338a`)
+
+The guard does what it was built for on the live card: it holds within one
+poll of the model crossing the margin (twice), the card never sleeps with the
+model resident, and it releases within a second of the unload with D3cold
+7 s later, across two runs, the 5-cycle and storm batteries, and zero kernel
+faults. The two observability defects (status label, runtime state directory)
+do not affect the hold/release path and are on `t_35c35fc7`; the stop-path
+design question is for Forge. Operator lessons recorded: Mission Center and
+any 1-s `status` poller hold the card awake and must be off for D3cold timing.
