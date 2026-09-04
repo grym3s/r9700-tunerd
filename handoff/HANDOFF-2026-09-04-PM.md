@@ -152,3 +152,26 @@ daemon, launch GTK, run `tests/hw/`, start LM Studio, or call
 - Board watcher: status changes + 5-min digest.
 - Kernel-log watch for dongle faults (`8822bu`, USB resets).
 Re-arm both after boot if the session continues.
+
+## 7. Post-shutdown results (orchestrator, 17:12–17:36)
+
+- Cold boot 17:12:29. `reboot-check` PASS 7/7. Host OCuLink link: 16 GT/s x4
+  at enumeration, **8 GT/s x4 after the first D3cold exit and under load**
+  (`pp_dpm_pcie` lists only 2.5/16); cold shutdown restores Gen4 only until
+  the first resume. Not a tuner defect; consider logging the link speed on
+  each wake.
+- **Eviction guard accepted on hardware**: `docs/ACCEPTANCE-evict-guard.md`.
+  Hold within one poll (twice), release +0.8 s after unload, D3cold +7.1 s,
+  cycles 5/5, storm 10/10, zero faults. Card `t_7fc5338a` unblocked for
+  Forge's sign-off (a Forge worker had tried to run the hardware steps itself
+  and loaded a 27.9 GiB model with Halo resident; it was reclaimed and the
+  hardware steps stay with the orchestrator).
+- Two observability defects found and fixed (`t_35c35fc7`, main `3b286f2`,
+  installed 17:35): shared `RuntimeDirectory` deleted `/run/r9700-tunerd`
+  when the apply oneshot exited (dashboard blind); `status` could never say
+  `holding`. Open design question for Forge: stop/`ExecStopPost` release the
+  hold even with a >GTT model resident.
+- Operator lessons: Mission Center, and any 1-s poller that calls
+  `r9700-tunerd status` while the card is active, hold the card awake.
+  `pgrep -f`/`pkill -f` self-match bit the orchestrator again; use `ps | grep "[p]attern"`.
+- Halo's server is running again; LM Studio server stopped; Ray's model unloaded.

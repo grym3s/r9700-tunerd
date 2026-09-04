@@ -84,6 +84,12 @@ LM Studio server stopped and Halo's server restarted afterwards.
 2. **Status label is process-local.** `cmd_status()` reads `_evict.holding` in
    the status process, never the daemon's state, so it can never print
    `holding`. Same card.
+
+   Both fixed by Sonnet, reviewed by Forge (101 tests), cherry-picked to main
+   as `3b286f2` and installed at 17:35. Verified live: `install.sh`'s udev
+   trigger re-ran the apply oneshot and `/run/r9700-tunerd/{state,ranges.json}`
+   survived; `status` now prints the label from the state file
+   (`evict_guard=idle vram_used=unknown gtt_total=16.6G` while idle).
 3. **Design question for Forge (not a code change by the orchestrator):** the
    stop path (`released hold on shutdown`, and `ExecStopPost=release-hold`)
    releases the hold even when a >GTT model is still resident, which recreates
