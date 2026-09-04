@@ -36,7 +36,7 @@ header{display:flex;align-items:center;justify-content:space-between;gap:16px;pa
 .bar{position:relative;height:10px;background:#0a0d11;border:1px solid var(--line);border-radius:6px;overflow:hidden;margin-top:10px}
 .bar i{position:absolute;left:0;top:0;bottom:0;background:linear-gradient(90deg,var(--accent2),var(--accent));border-radius:6px;transition:width .4s}
 .bar b{position:absolute;top:-2px;bottom:-2px;width:2px;background:#fff;opacity:.8}
-canvas{width:100%;height:120px;display:block;background:#0a0d11;border:1px solid var(--line);border-radius:10px}
+canvas{width:100%;height:150px;display:block;background:#0a0d11;border:1px solid var(--line);border-radius:10px}
 .slider{margin:12px 0 4px}
 .slider label{display:flex;justify-content:space-between;font-family:var(--mono);font-size:13px;color:var(--muted);margin-bottom:6px}
 .slider label output{color:var(--text);font-weight:700;font-size:15px}
@@ -48,7 +48,7 @@ button:hover{border-color:var(--accent)}button:active{transform:translateY(1px)}
 button.primary{background:linear-gradient(135deg,var(--accent),#c2380a);border-color:transparent}
 button.danger{border-color:#5a2222}button.danger:hover{border-color:var(--bad)}
 button:disabled{opacity:.45;cursor:not-allowed}
-.profiles{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+.profiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
 .profile{border:1px solid var(--line);border-radius:12px;padding:12px;cursor:pointer;background:var(--panel2);text-align:left}
 .profile:hover{border-color:var(--accent)}
 .profile.current{border-color:var(--ok);box-shadow:inset 0 0 0 1px var(--ok)}
@@ -65,7 +65,8 @@ pre.log{margin:0;font-family:var(--mono);font-size:12px;color:#b9c4cf;background
 .toast.ok{border-left-color:var(--ok)}.toast.bad{border-left-color:var(--bad)}
 .muted{color:var(--muted)}
 .foot{margin-top:18px;color:var(--muted);font-size:12px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px}
-@media (max-width:900px){.card,.card.wide{grid-column:span 12}.profiles{grid-template-columns:repeat(2,1fr)}}
+@media (max-width:1180px){.card{grid-column:span 6}.card.wide{grid-column:span 12}}
+@media (max-width:760px){.card,.card.wide{grid-column:span 12}}
 </style>
 </head>
 <body>
@@ -100,7 +101,7 @@ pre.log{margin:0;font-family:var(--mono);font-size:12px;color:#b9c4cf;background
 
     <div class="card wide">
       <h2>Live trace <span class="muted" id="tracehint">(samples only while the card is awake)</span></h2>
-      <canvas id="trace" width="1200" height="240"></canvas>
+      <canvas id="trace"></canvas>
     </div>
     <div class="card">
       <h2>Runtime PM</h2>
@@ -173,28 +174,41 @@ pre.log{margin:0;font-family:var(--mono);font-size:12px;color:#b9c4cf;background
   const toast = (msg, cls='') => { const t=$('toast'); t.textContent=msg; t.className='toast '+cls; t.style.display='block'; clearTimeout(t._h); t._h=setTimeout(()=>t.style.display='none', 6000); };
 
   // ---- live trace (power, junction) ----
-  const hist = []; const MAXH = 240;
+  // Time-based trace: the last WINDOW_S seconds, newest sample at the right
+  // edge, canvas sized to its container in device pixels so it never scales
+  // blurry or fills only part of the width.
+  const hist = []; const WINDOW_S = 120; const MAXH = 2000;
   const canvas = $('trace'); const ctx = canvas.getContext('2d');
+  function fitCanvas(){ const dpr = window.devicePixelRatio || 1; const w = canvas.clientWidth || 1200, h = canvas.clientHeight || 120;
+    if (canvas.width !== Math.round(w*dpr) || canvas.height !== Math.round(h*dpr)) { canvas.width = Math.round(w*dpr); canvas.height = Math.round(h*dpr); } }
+  window.addEventListener('resize', () => { fitCanvas(); draw(); });
   function draw() {
-    const W = canvas.width, H = canvas.height; ctx.clearRect(0,0,W,H);
+    fitCanvas();
+    const W = canvas.width, H = canvas.height; const dpr = window.devicePixelRatio || 1; ctx.clearRect(0,0,W,H);
     ctx.fillStyle = '#0a0d11'; ctx.fillRect(0,0,W,H);
     ctx.strokeStyle = '#1c232c'; ctx.lineWidth = 1;
     for (let y=0; y<=4; y++){ ctx.beginPath(); ctx.moveTo(0, y*H/4); ctx.lineTo(W, y*H/4); ctx.stroke(); }
-    if (!hist.length) { ctx.fillStyle='#4a5563'; ctx.font='13px ui-monospace,monospace'; ctx.fillText('no samples yet — the card is asleep or the server just started', 16, H/2); return; }
+    const font = (px) => `${px*dpr}px ui-monospace,monospace`;
+    if (!hist.length) { ctx.fillStyle='#4a5563'; ctx.font=font(13); ctx.fillText('no samples yet — the card is asleep or the server just started', 16*dpr, H/2); return; }
+    const now = hist[hist.length-1].t; const t0 = now - WINDOW_S*1000;
+    const xOf = (t) => (t - t0) / (WINDOW_S*1000) * W;
     const cap = Math.max(...hist.map(h => h.cap || 330), 330);
+    // shading first (stale = grey, asleep = blue), one band per sample up to the next sample
+    for (let i = 0; i < hist.length; i++) {
+      const h = hist[i]; if (!h.stale && !h.sleep) continue;
+      const x1 = Math.max(0, xOf(h.t)); const x2 = i+1 < hist.length ? xOf(hist[i+1].t) : W;
+      ctx.fillStyle = h.sleep ? 'rgba(90,169,255,.12)' : 'rgba(255,255,255,.05)'; ctx.fillRect(x1, 0, Math.max(1, x2-x1), H);
+    }
     const line = (key, max, color) => {
-      ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.beginPath();
-      hist.forEach((h, i) => { const x = i * (W/(MAXH-1)); const v = h[key]; if (v === null || v === undefined) return;
-        const y = H - (v/max)*H*0.92 - 6; if (i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y); });
+      ctx.strokeStyle = color; ctx.lineWidth = 2*dpr; ctx.beginPath(); let pen = false;
+      hist.forEach((h) => { const v = h[key]; if (v === null || v === undefined) { pen = false; return; }
+        const x = xOf(h.t), y = H - (v/max)*H*0.92 - 6*dpr; if (!pen) { ctx.moveTo(x,y); pen = true; } else ctx.lineTo(x,y); });
       ctx.stroke();
     };
     line('power', cap, '#ff5c1a'); line('tj', 110, '#5aa9ff');
-    ctx.fillStyle='rgba(255,255,255,.05)'; hist.forEach((h,i)=>{ if (h.stale) ctx.fillRect(i*(W/(MAXH-1)), 0, W/(MAXH-1)+1, H); });
-    ctx.fillStyle='#ff5c1a'; ctx.font='12px ui-monospace,monospace'; ctx.fillText('power W (0–'+cap+')', 12, 16);
-    ctx.fillStyle='#5aa9ff'; ctx.fillText('junction °C (0–110)', 150, 16);
-    // sleep markers
-    ctx.fillStyle='rgba(90,169,255,.12)';
-    hist.forEach((h,i)=>{ if (h.sleep) ctx.fillRect(i*(W/(MAXH-1)), 0, W/(MAXH-1)+1, H); });
+    ctx.fillStyle='#ff5c1a'; ctx.font=font(12); ctx.fillText('power W (0–'+cap+')', 12*dpr, 16*dpr);
+    ctx.fillStyle='#5aa9ff'; ctx.fillText('junction °C (0–110)', 150*dpr, 16*dpr);
+    ctx.fillStyle='#4a5563'; ctx.fillText('last '+WINDOW_S+' s', W-90*dpr, 16*dpr);
   }
 
   // ---- state rendering ----
@@ -237,13 +251,13 @@ pre.log{margin:0;font-family:var(--mono);font-size:12px;color:#b9c4cf;background
       $('fan').textContent = l.fan_rpm != null ? l.fan_rpm+' rpm' : '—';
       $('sclk').textContent = fmt(l.sclk_mhz,0); $('mclk').textContent = fmt(l.mclk_mhz,0)+' MHz'; $('busy').textContent = l.gpu_busy != null ? l.gpu_busy+' %' : '—';
       $('vo').textContent = l.offset_mv != null ? l.offset_mv+' mV' : '—';
-      if (s.live_age_s == null || s.live_age_s < 2.5) hist.push({power: l.power_w, tj: l.junction_c, cap: l.cap_w, sleep:false}); else hist.push({power: l.power_w, tj: l.junction_c, cap: l.cap_w, sleep:false, stale:true});
+      if (s.live_age_s == null || s.live_age_s < 2.5) hist.push({t: Date.now(), power: l.power_w, tj: l.junction_c, cap: l.cap_w, sleep:false}); else hist.push({t: Date.now(), power: l.power_w, tj: l.junction_c, cap: l.cap_w, sleep:false, stale:true});
     } else {
       ['pw','tj','sclk'].forEach(id => $(id).textContent = '—'); $('pwbar').style.width = '0%';
       $('vo').textContent = tuned ? `${tuned.offset_mv} mV (config; card asleep)` : '—'; $('fan').textContent = '0 rpm (firmware)';
-      hist.push({power:null, tj:null, cap:null, sleep:true});
+      hist.push({t: Date.now(), power:null, tj:null, cap:null, sleep:true});
     }
-    while (hist.length > MAXH) hist.shift(); draw();
+    while (hist.length > MAXH || (hist.length > 1 && hist[0].t < Date.now() - (WINDOW_S+5)*1000)) hist.shift(); draw();
     if (s.recent_journal) $('journal').textContent = s.recent_journal.join ? s.recent_journal.join('\n') : s.recent_journal;
     markProfile();
   }
