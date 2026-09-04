@@ -404,12 +404,29 @@ class TestApiSet:
         code, body = _post(server, "/api/set", {"offset_mv": -25, "cap_w": 210})
         assert code == 200
         assert body["ok"] is True
-        # Two CLI calls: set-undervolt then set-power-cap
-        assert len(fake_subprocess) == 2
+        # Both values given: one atomic set-tuning call (single config
+        # write, single range-validation snapshot in the daemon).
+        assert len(fake_subprocess) == 1
+        assert fake_subprocess[0]["cmd"] == [
+            "sudo", "-n", "/usr/local/sbin/r9700-tunerd",
+            "set-tuning", "--offset-mv", "-25", "--cap-w", "210",
+        ]
+
+    def test_offset_only_uses_set_undervolt(self, server, fake_subprocess):
+        code, body = _post(server, "/api/set", {"offset_mv": -25})
+        assert code == 200
+        assert body["ok"] is True
+        assert len(fake_subprocess) == 1
         assert fake_subprocess[0]["cmd"] == [
             "sudo", "-n", "/usr/local/sbin/r9700-tunerd", "set-undervolt", "-25"
         ]
-        assert fake_subprocess[1]["cmd"] == [
+
+    def test_cap_only_uses_set_power_cap(self, server, fake_subprocess):
+        code, body = _post(server, "/api/set", {"cap_w": 210})
+        assert code == 200
+        assert body["ok"] is True
+        assert len(fake_subprocess) == 1
+        assert fake_subprocess[0]["cmd"] == [
             "sudo", "-n", "/usr/local/sbin/r9700-tunerd", "set-power-cap", "210"
         ]
 
