@@ -30,6 +30,18 @@ RANGES_PATH = STATE_DIR / "ranges.json"
 PCI_ROOT = Path("/sys/bus/pci/devices")
 SYSLOG_IDENT = "r9700-tunerd"
 
+
+class _EvictGuardState:
+    """Module-level runtime state for the VRAM-eviction guard."""
+    holding = False       # True when we've written "on" to power/control
+    last_vram = 0         # last measured VRAM bytes
+    last_gtt = 0          # cached GTT total bytes
+    logged_hold = False   # True after first hold log (don't spam)
+    logged_release = False
+
+
+_evict = _EvictGuardState()
+
 # Fallback only if a key is missing from config. Never treat these as the
 # live policy; /etc/r9700-tunerd.conf is the source of truth.
 DEFAULTS = {
@@ -40,6 +52,8 @@ DEFAULTS = {
     "POWER_LIMIT_W": "210",
     "VOLTAGE_OFFSET_MV": "0",
     "POLL_INTERVAL_S": "2",
+    "EVICT_GUARD": "1",
+    "EVICT_GUARD_MARGIN": "0.90",
 }
 
 KNOWN_KEYS = frozenset(DEFAULTS.keys())
@@ -129,6 +143,11 @@ def write_text(path: Path, value: str) -> None:
             off += n
     finally:
         os.close(fd)
+
+
+def write_sysfs(path: Path | str, value: str) -> None:
+    """Write value (plus trailing newline) to a sysfs attribute path."""
+    write_text(Path(path), value if value.endswith("\n") else value + "\n")
 
 
 def _atomic_write(path: Path, data: bytes) -> None:
@@ -246,7 +265,160 @@ def validate_conf(conf: dict[str, str]) -> tuple[dict, list[str]]:
         problems.append(f"POLL_INTERVAL_S={raw!r} is not a valid number")
         parsed["POLL_INTERVAL_S"] = None
 
+    # EVICT_GUARD: boolean 0 or 1
+    raw = conf.get("EVICT_GUARD", "")
+    try:
+        v = int(raw)
+        if v not in (0, 1):
+            problems.append(f"EVICT_GUARD={v} must be 0 or 1")
+            parsed["EVICT_GUARD"] = None
+        else:
+            parsed["EVICT_GUARD"] = bool(v)
+    except (ValueError, TypeError):
+        problems.append(f"EVICT_GUARD={raw!r} is not a valid boolean (0/1)")
+        parsed["EVICT_GUARD"] = None
+
+    # EVICT_GUARD_MARGIN: float, 0.0 < v <= 1.0
+    raw = conf.get("EVICT_GUARD_MARGIN", "")
+    try:
+        v = float(raw)
+        if v <= 0.0 or v > 1.0:
+            problems.append(f"EVICT_GUARD_MARGIN={v} out of range (0.0, 1.0]")
+            parsed["EVICT_GUARD_MARGIN"] = None
+        else:
+            parsed["EVICT_GUARD_MARGIN"] = v
+    except (ValueError, TypeError):
+        problems.append(f"EVICT_GUARD_MARGIN={raw!r} is not a valid number")
+        parsed["EVICT_GUARD_MARGIN"] = None
+
     return parsed, problems
+
+
+# ---------------------------------------------------------------------------
+# Evict guard: VRAM-in-use and GTT-total helpers
+# ---------------------------------------------------------------------------
+
+PROC_ROOT = Path("/proc")
+MEMINFO_PATH = Path("/proc/meminfo")
+
+_gtt_cache: dict[str, int] = {}
+_gtt_fallback_warned = False
+
+
+def _parse_kib(value: str) -> int | None:
+    """Parse a drm fdinfo value like '12345 KiB' -> 12345, else None."""
+    parts = value.split()
+    if not parts:
+        return None
+    try:
+        return int(parts[0])
+    except ValueError:
+        return None
+
+
+def drm_vram_in_use(pci_addr: str) -> int:
+    """Sum VRAM (bytes) currently in use on pci_addr, via /proc/*/fdinfo.
+
+    Scans every open fd of every process that is a symlink into
+    /dev/dri/*, parses the fdinfo key/value block, and keeps the max
+    drm-total-vram (or drm-memory-vram fallback) per unique
+    drm-client-id to avoid double-counting the same client opened on
+    multiple fds. Never opens /dev/dri/* itself.
+    """
+    clients: dict[str, int] = {}
+    try:
+        entries = os.listdir(PROC_ROOT)
+    except OSError:
+        return 0
+
+    for pid in entries:
+        if not pid.isdigit():
+            continue
+        fd_dir = PROC_ROOT / pid / "fd"
+        try:
+            fds = os.listdir(fd_dir)
+        except (PermissionError, FileNotFoundError, ProcessLookupError, OSError):
+            continue
+        for fd in fds:
+            try:
+                target = os.readlink(fd_dir / fd)
+            except (PermissionError, FileNotFoundError, ProcessLookupError, OSError):
+                continue
+            if not target.startswith("/dev/dri/"):
+                continue
+
+            fdinfo_path = PROC_ROOT / pid / "fdinfo" / fd
+            try:
+                text = fdinfo_path.read_text(encoding="utf-8", errors="replace")
+            except (PermissionError, FileNotFoundError, ProcessLookupError, OSError):
+                continue
+
+            pdev = None
+            client_id = None
+            total_vram_kib = None
+            mem_vram_kib = None
+            for line in text.splitlines():
+                if ":" not in line:
+                    continue
+                k, _, v = line.partition(":")
+                k = k.strip()
+                v = v.strip()
+                if k == "drm-pdev":
+                    pdev = v
+                elif k == "drm-client-id":
+                    client_id = v
+                elif k == "drm-total-vram":
+                    total_vram_kib = _parse_kib(v)
+                elif k == "drm-memory-vram":
+                    mem_vram_kib = _parse_kib(v)
+
+            if pdev != pci_addr or client_id is None:
+                continue
+            kib = total_vram_kib if total_vram_kib is not None else mem_vram_kib
+            if kib is None:
+                continue
+            if kib > clients.get(client_id, 0):
+                clients[client_id] = kib
+
+    return sum(clients.values()) * 1024
+
+
+def gtt_total_bytes(pci) -> int:
+    """Return the GPU's total GTT size in bytes, cached at module level.
+
+    Only ever called (via the caller's contract) while the device is
+    runtime-active; this function does not itself check runtime_status.
+    Falls back to MemTotal/2 (from /proc/meminfo) if the sysfs file is
+    unreadable, logging that fallback once.
+    """
+    global _gtt_fallback_warned
+    key = str(pci)
+    if key in _gtt_cache:
+        return _gtt_cache[key]
+
+    try:
+        val = int(read_text(Path(pci) / "mem_info_gtt_total"))
+        _gtt_cache[key] = val
+        return val
+    except (OSError, ValueError):
+        pass
+
+    val = 0
+    try:
+        for line in MEMINFO_PATH.read_text(encoding="utf-8").splitlines():
+            if line.startswith("MemTotal:"):
+                mem_total_kb = int(line.split()[1])
+                val = (mem_total_kb * 1024) // 2
+                break
+    except (OSError, ValueError, IndexError):
+        val = 0
+
+    if not _gtt_fallback_warned:
+        log(f"gtt_total_bytes: {pci} mem_info_gtt_total unreadable, falling back to MemTotal/2", syslog.LOG_WARNING)
+        _gtt_fallback_warned = True
+
+    _gtt_cache[key] = val
+    return val
 
 
 def pci_ids(dev: Path) -> tuple[str, str, str, str] | None:
@@ -312,7 +484,9 @@ def require_runtime_pm(pci: Path) -> None:
     """Refuse to write if power/control is not 'auto'.
 
     On an APU the display iGPU runs with control=on, so this guard is what
-    stops a mistyped identity from tuning the display GPU.
+    stops a mistyped identity from tuning the display GPU. When the evict
+    guard has intentionally pinned control=on to hold the dGPU awake, that
+    condition is expected and the check passes.
     """
     last_err: OSError | None = None
     for attempt in range(3):
@@ -325,6 +499,8 @@ def require_runtime_pm(pci: Path) -> None:
             continue
         # Successfully read the value.
         if val != "auto":
+            if val == "on" and _evict.holding:
+                return  # evict-guard intentionally holding — pass
             raise RuntimeError(
                 f"power/control={val}; this tool only writes to "
                 "runtime-PM-managed GPUs (control=auto); refusing"
@@ -485,8 +661,32 @@ def reset_od(pci: Path) -> None:
         pass
 
 
-def write_state(payload: str) -> None:
-    """Atomically write state file (best-effort; /run may be absent)."""
+def write_state(payload: str = "", *, state: str | None = None, pci=None,
+                 vo=None, vram_used: int | None = None,
+                 gtt_total: int | None = None, **extra) -> None:
+    """Atomically write state file (best-effort; /run may be absent).
+
+    Two call forms are supported:
+      - write_state(raw_payload_string)               — legacy, pre-built text
+      - write_state(state=..., pci=..., vo=..., ...)   — builds the payload
+        from keyword fields, adding vram_used/gtt_total when given.
+    """
+    if not payload:
+        lines = []
+        if pci is not None:
+            lines.append(f"pci={pci.name}")
+        if state is not None:
+            lines.append(f"state={state}")
+        if vo is not None:
+            lines.append(f"vo={vo}")
+        if vram_used is not None:
+            lines.append(f"vram_used={vram_used}")
+        if gtt_total is not None:
+            lines.append(f"gtt_total={gtt_total}")
+        for k, v in extra.items():
+            lines.append(f"{k}={v}")
+        lines.append(f"ts={int(time.time())}")
+        payload = "\n".join(lines) + "\n"
     try:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         _atomic_write(STATE_DIR / "state", payload.encode("utf-8"))
@@ -1099,6 +1299,42 @@ def cmd_watch(conf: dict) -> int:
                     else:
                         susp_at_last_wake = _new_susp
                         _susp_prev_ok = True
+
+                # --- Eviction guard: hold/release power/control ---------
+                if conf_now.get("EVICT_GUARD"):
+                    vo = conf_now["VOLTAGE_OFFSET_MV"]
+                    vram = drm_vram_in_use(pci.name)
+                    margin = conf_now["EVICT_GUARD_MARGIN"]
+                    gtt = gtt_total_bytes(pci)  # cached after first call
+
+                    if not _evict.holding and vram > margin * gtt:
+                        write_sysfs(pci / "power" / "control", "on")
+                        _evict.holding = True
+                        _evict.last_vram = vram
+                        _evict.last_gtt = gtt
+                        if not _evict.logged_hold:
+                            log(
+                                "evict-guard: holding dGPU awake — VRAM "
+                                f"{vram/1e9:.1f}G > {margin*100:.0f}% of GTT "
+                                f"{gtt/1e9:.1f}G",
+                                syslog.LOG_WARNING,
+                            )
+                            _evict.logged_hold = True
+                            _evict.logged_release = False
+                        write_state(state="ACTIVE_HELD", pci=pci, vo=vo,
+                                    vram_used=vram, gtt_total=gtt)
+                    elif _evict.holding and vram < 0.8 * margin * gtt:
+                        write_sysfs(pci / "power" / "control", "auto")
+                        _evict.holding = False
+                        if not _evict.logged_release:
+                            log(
+                                "evict-guard: released hold — VRAM "
+                                f"{vram/1e9:.1f}G < {0.8*margin*100:.0f}% of "
+                                f"GTT {gtt/1e9:.1f}G"
+                            )
+                            _evict.logged_release = True
+                            _evict.logged_hold = False
+                        write_state(state="ACTIVE_CONFIGURED", pci=pci, vo=vo)
             elif st == "suspended":
                 if state != ST_SUSPENDED:
                     log("R9700 runtime suspended")
