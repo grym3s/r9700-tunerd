@@ -40,6 +40,8 @@ DEFAULTS = {
     "POWER_LIMIT_W": "210",
     "VOLTAGE_OFFSET_MV": "0",
     "POLL_INTERVAL_S": "2",
+    "EVICT_GUARD": "0",
+    "EVICT_GUARD_MARGIN": "0.90",
 }
 
 KNOWN_KEYS = frozenset(DEFAULTS.keys())
@@ -246,7 +248,160 @@ def validate_conf(conf: dict[str, str]) -> tuple[dict, list[str]]:
         problems.append(f"POLL_INTERVAL_S={raw!r} is not a valid number")
         parsed["POLL_INTERVAL_S"] = None
 
+    # EVICT_GUARD: boolean 0 or 1
+    raw = conf.get("EVICT_GUARD", "")
+    try:
+        v = int(raw)
+        if v not in (0, 1):
+            problems.append(f"EVICT_GUARD={v} must be 0 or 1")
+            parsed["EVICT_GUARD"] = None
+        else:
+            parsed["EVICT_GUARD"] = bool(v)
+    except (ValueError, TypeError):
+        problems.append(f"EVICT_GUARD={raw!r} is not a valid boolean (0/1)")
+        parsed["EVICT_GUARD"] = None
+
+    # EVICT_GUARD_MARGIN: float, 0.0 < v <= 1.0
+    raw = conf.get("EVICT_GUARD_MARGIN", "")
+    try:
+        v = float(raw)
+        if v <= 0.0 or v > 1.0:
+            problems.append(f"EVICT_GUARD_MARGIN={v} out of range (0.0, 1.0]")
+            parsed["EVICT_GUARD_MARGIN"] = None
+        else:
+            parsed["EVICT_GUARD_MARGIN"] = v
+    except (ValueError, TypeError):
+        problems.append(f"EVICT_GUARD_MARGIN={raw!r} is not a valid number")
+        parsed["EVICT_GUARD_MARGIN"] = None
+
     return parsed, problems
+
+
+# ---------------------------------------------------------------------------
+# Evict guard: VRAM-in-use and GTT-total helpers
+# ---------------------------------------------------------------------------
+
+PROC_ROOT = Path("/proc")
+MEMINFO_PATH = Path("/proc/meminfo")
+
+_gtt_cache: dict[str, int] = {}
+_gtt_fallback_warned = False
+
+
+def _parse_kib(value: str) -> int | None:
+    """Parse a drm fdinfo value like '12345 KiB' -> 12345, else None."""
+    parts = value.split()
+    if not parts:
+        return None
+    try:
+        return int(parts[0])
+    except ValueError:
+        return None
+
+
+def drm_vram_in_use(pci_addr: str) -> int:
+    """Sum VRAM (bytes) currently in use on pci_addr, via /proc/*/fdinfo.
+
+    Scans every open fd of every process that is a symlink into
+    /dev/dri/*, parses the fdinfo key/value block, and keeps the max
+    drm-total-vram (or drm-memory-vram fallback) per unique
+    drm-client-id to avoid double-counting the same client opened on
+    multiple fds. Never opens /dev/dri/* itself.
+    """
+    clients: dict[str, int] = {}
+    try:
+        entries = os.listdir(PROC_ROOT)
+    except OSError:
+        return 0
+
+    for pid in entries:
+        if not pid.isdigit():
+            continue
+        fd_dir = PROC_ROOT / pid / "fd"
+        try:
+            fds = os.listdir(fd_dir)
+        except (PermissionError, FileNotFoundError, ProcessLookupError, OSError):
+            continue
+        for fd in fds:
+            try:
+                target = os.readlink(fd_dir / fd)
+            except (PermissionError, FileNotFoundError, ProcessLookupError, OSError):
+                continue
+            if not target.startswith("/dev/dri/"):
+                continue
+
+            fdinfo_path = PROC_ROOT / pid / "fdinfo" / fd
+            try:
+                text = fdinfo_path.read_text(encoding="utf-8", errors="replace")
+            except (PermissionError, FileNotFoundError, ProcessLookupError, OSError):
+                continue
+
+            pdev = None
+            client_id = None
+            total_vram_kib = None
+            mem_vram_kib = None
+            for line in text.splitlines():
+                if ":" not in line:
+                    continue
+                k, _, v = line.partition(":")
+                k = k.strip()
+                v = v.strip()
+                if k == "drm-pdev":
+                    pdev = v
+                elif k == "drm-client-id":
+                    client_id = v
+                elif k == "drm-total-vram":
+                    total_vram_kib = _parse_kib(v)
+                elif k == "drm-memory-vram":
+                    mem_vram_kib = _parse_kib(v)
+
+            if pdev != pci_addr or client_id is None:
+                continue
+            kib = total_vram_kib if total_vram_kib is not None else mem_vram_kib
+            if kib is None:
+                continue
+            if kib > clients.get(client_id, 0):
+                clients[client_id] = kib
+
+    return sum(clients.values()) * 1024
+
+
+def gtt_total_bytes(pci) -> int:
+    """Return the GPU's total GTT size in bytes, cached at module level.
+
+    Only ever called (via the caller's contract) while the device is
+    runtime-active; this function does not itself check runtime_status.
+    Falls back to MemTotal/2 (from /proc/meminfo) if the sysfs file is
+    unreadable, logging that fallback once.
+    """
+    global _gtt_fallback_warned
+    key = str(pci)
+    if key in _gtt_cache:
+        return _gtt_cache[key]
+
+    try:
+        val = int(read_text(Path(pci) / "mem_info_gtt_total"))
+        _gtt_cache[key] = val
+        return val
+    except (OSError, ValueError):
+        pass
+
+    val = 0
+    try:
+        for line in MEMINFO_PATH.read_text(encoding="utf-8").splitlines():
+            if line.startswith("MemTotal:"):
+                mem_total_kb = int(line.split()[1])
+                val = (mem_total_kb * 1024) // 2
+                break
+    except (OSError, ValueError, IndexError):
+        val = 0
+
+    if not _gtt_fallback_warned:
+        log(f"gtt_total_bytes: {pci} mem_info_gtt_total unreadable, falling back to MemTotal/2", syslog.LOG_WARNING)
+        _gtt_fallback_warned = True
+
+    _gtt_cache[key] = val
+    return val
 
 
 def pci_ids(dev: Path) -> tuple[str, str, str, str] | None:
