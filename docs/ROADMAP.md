@@ -18,7 +18,7 @@ validated on the live card.
    -50/-75/-100 mV candidates; objective is best sustained throughput per watt with
    zero instability, not the largest offset. Then EFFICIENCY / BALANCED /
    PERFORMANCE profiles from measured data.
-5. **GPU tuning UI** (v1 DONE 2026-09-04: tools/r9700-ui.py + ui/index.html; next: tray/launcher integration, profile editing, matrix results view)
+5. **GPU tuning UI** (v1 DONE 2026-09-04: tools/r9700-ui.py + ui/index.html; PROFILES delivered pending hardware acceptance; next: tray/launcher integration, profile editing, matrix results view)
    – a thin front end over the daemon: voltage-offset slider bounded by the live
    `OD_RANGE`, power-cap slider bounded by `power1_cap_min/max`, profile buttons,
    Apply / Benchmark / Restore-defaults, live state (D3cold / active / tuned,
@@ -26,7 +26,7 @@ validated on the live card.
    `status --json` and a small local IPC (unix socket) so the UI never touches
    sysfs itself and never holds the card awake; (b) profiles from Phase 4 data.
    Not before Phases 2–4 are accepted.
-6. **Custom fan curve** (owner request 2026-09-04; see handoff/HANDOFF.md §10 item 6)
+6. **Custom fan curve** (delivered pending hardware acceptance; owner request 2026-09-04; see handoff/HANDOFF.md §10 item 6)
    – active-only controller with firmware fallback on every exit path, curve
    editor in the app writing through the daemon CLI. Must pass the dashboard
    hazard test with the controller enabled.

@@ -21,6 +21,10 @@ No DRM/render-node handles. No LACT on the control path. No fan curve yet.
     r9700-tunerd reset
     r9700-tunerd set-undervolt -50     # validated against the live or cached OD range
     r9700-tunerd set-power-cap 250     # validated against the live or cached cap range
+    r9700-tunerd set-tuning --offset-mv -50 --cap-w 250  # both at once
+    r9700-tunerd list-profiles         # show available profiles and their tuning
+    r9700-tunerd set-profile BALANCED  # apply a named profile from the internal table
+    r9700-tunerd set-fan-curve 55:30 65:40 75:50 85:70  # set temp/PWM curve (°C:%)
     r9700-tunerd probe-poll
 
 ## Features

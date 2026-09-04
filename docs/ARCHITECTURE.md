@@ -136,7 +136,57 @@ it is a no-op and logs which condition was not met. Wired as ExecStopPost in the
 it runs even if the daemon is killed uncleanly, guaranteeing the card cannot be held awake
 forever.
 
+## Tuning profiles
+
+Profiles are named sets of tuning parameters (VDDGFX offset and power cap) derived
+from the phase 4 characterisation harness, each tuned for a different workload
+balance: EFFICIENCY (lowest-power stable point), BALANCED (best per-watt throughput),
+and PERFORMANCE (highest throughput, within stability margins).
+
+A profile resolves to an offset/cap pair in `/etc/r9700-tunerd.conf` via the `PROFILE`
+config key (e.g. `PROFILE=BALANCED`). The profile name is passed to `set-profile`,
+which reads the corresponding offset and cap from the daemon's internal profile table,
+validates them against the live OD_RANGE and power1_cap_min/max sysfs files (the same
+validation path as `set-tuning`), writes them to config, and applies them atomically
+via the same single-range-snapshot apply path as explicit `set-tuning` calls.
+
+**Safety rationale:** profiles are read-only, immutable tuning prescriptions derived from
+offline characterisation on a known-good baseline. They cannot be edited live (editing
+would defeat the characterisation); users who want custom offsets use `set-tuning` instead.
+When `set-tuning` is called while a profile is active, the profile name is discarded and
+the config state changes from `PROFILE=<name>` to `PROFILE=CUSTOM`, preserving the new
+offset/cap but flagging that the machine is no longer on a blessed preset. A subsequent
+`set-profile` call flips the state back from CUSTOM to the chosen profile name.
+
+`list-profiles` prints the available profiles and their target offsets/caps, allowing a
+user to review all options without touching hardware.
+
+## Fan curve controller
+
+The fan curve (FAN_CURVE_ENABLED, default disabled) is an active-only state machine
+that interpolates firmware PWM duty from a temperature curve only while the GPU is
+`runtime_status=active`. The curve is defined by temperature/PWM points in the config
+(e.g. `FAN_POINT_1=55:30` means 30% PWM at 55°C); linear interpolation between points
+and clamping at the edges handles in-between temperatures. When the GPU enters D3cold
+(power/runtime_status changes from active to suspended), the controller writes \"0\"
+to the firmware control sysfs file, releasing manual control back to firmware auto mode
+(the fallback), which spins the fans down to 0 RPM.
+
+The controller has one entry point (the `set-fan-curve` command, which parses and
+validates the new curve against sysfs limits, updates config, then applies atomically
+via a read-before-write guard), and many exit paths that must restore the fallback:
+normal daemon `watch` loop transitions to suspended, daemon SIGTERM/SIGINT on exit,
+unclean daemon death (SIGKILL), driver rebind, GPU reset, and any system crash. To
+survive all exit paths, the `r9700-tunerd.service` unit has `ExecStopPost=r9700-tunerd
+fan-release`, which runs even on SIGKILL and writes the fallback-enable value to
+firmware control.
+
+**Safety rationale:** a stuck manual curve that prevents the firmware from spinning
+the fans down will cause thermal runaway on idle workloads or notebook mode. The
+firmware fallback is the only safe default; the daemon releases it on every exit
+path without exception. Hysteresis (FAN_HYSTERESIS_C, default 2°C) prevents flapping
+when temperature oscillates near a curve point.
+
 ## Out of scope for now
 
-Fan control (firmware auto mode is required for 0 RPM; manual curves floor at 30 %),
-clock offsets, profiles, benchmarking, UI. See docs/ROADMAP.md.
+Clock offsets, benchmarking, additional thermal sensors. See docs/ROADMAP.md.

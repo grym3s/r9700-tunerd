@@ -43,7 +43,7 @@ Quick regression after any daemon change (watcher installed and running):
     sudo tests/hw/r9700-hwtest.py config-typo
     sudo tests/hw/r9700-hwtest.py sigterm
 
-## 2b. Measurement harness (`tools/r9700-bench.py`, no root)
+## 2a. Measurement harness (`tools/r9700-bench.py`, no root)
 
 Read-only. `sample` streams GPU state to CSV (only `runtime_status`,
 `power_state`, `runtime_suspended_time` while asleep); `run` drives an
@@ -51,6 +51,48 @@ OpenAI-compatible endpoint with a fixed prompt set while sampling and writes
 JSON+CSV with tok/s, power, temps, clocks, offset/cap stability and
 time-to-D3cold; `compare DIR` tabulates results by tok/s per W. It never changes
 tuning: set the offset/cap with `r9700-tunerd` first.
+
+## 2b. Profile testing (no root, no hardware)
+
+Unit tests cover profile name validation and resolution to offset/cap pairs. To test
+manually without hardware:
+
+    python3 -c "from r9700_tunerd import PROFILES; print(PROFILES)"
+    r9700-tunerd list-profiles           # unprivileged, safe to run anytime
+
+Profile unit tests are in `tests/test-profiles.py` and run as part of the main suite:
+
+    python -m pytest -q tests/test-profiles.py
+
+No config changes or hardware access.
+
+## 2c. Fan curve testing (no root, with fake sysfs)
+
+Unit tests cover curve parsing, temperature interpolation, and hysteresis logic in a
+fake hwmon environment. To test manually:
+
+    python -m pytest -q tests/test-fan-curve.py
+
+The test suite provides fake temperature files and validates PWM calculation at each
+point and between points, as well as the edge-clamping and hysteresis behaviour.
+
+Fan curve hardware acceptance (root, owner-only):
+
+1. Ensure FAN_CURVE_ENABLED=1 and a curve is configured in r9700-tunerd.conf:
+   `FAN_POINT_1=55:30 FAN_POINT_2=65:40 FAN_POINT_3=75:50 FAN_POINT_4=85:70`
+2. Start the daemon: `sudo systemctl start r9700-tunerd`.
+3. While idle, monitor the current fan PWM:
+   `watch -n 1 'cat /sys/bus/pci/devices/$(r9700-tunerd discover | grep pci= | cut -d= -f2)/hwmon/hwmon*/pwm1'`
+4. Generate load on the GPU (e.g. start an LLM inference) and observe PWM climbing
+   according to the curve as temperature rises.
+5. Stop the workload and verify PWM returns toward the idle point (or zero if idle
+   long enough for D3cold).
+6. Stop the daemon: `sudo systemctl stop r9700-tunerd`.
+7. Verify the PWM file reads 0 (firmware auto mode restored):
+   `cat /sys/bus/pci/devices/$(r9700-tunerd discover | grep pci= | cut -d= -f2)/hwmon/hwmon*/pwm1`
+8. Kill the daemon uncleanly and verify the same: `sudo killall -9 r9700-tunerd &&
+   sleep 1 && cat <pwm-path>` should read 0, proving ExecStopPost ran.
+9. Check daemon logs for any errors: `journalctl -u r9700-tunerd -n 50`.
 
 ## 3. Reboot acceptance procedure
 
@@ -84,10 +126,10 @@ the branch commit id in `docs/` history (paste the table into the PR/commit).
 udev rule backups from the first install are kept beside the rules with a
 `.bak-<date>` suffix (see README).
 
-## 5. Dashboard hazard test (must pass after any change to tools/r9700-ui.py)
+## 5. Dashboard hazard test (must pass with fan curve controller enabled)
 
-The dashboard's live sampling must never hold the card awake. With the server
-running and a client connected:
+The dashboard's live sampling must never hold the card awake and must not interfere
+with fan control. With the server running and a client connected:
 
     TOK=$(journalctl --user -u r9700-ui.service --no-pager | grep -o 'TOKEN: [0-9a-f]*' | tail -1 | cut -d' ' -f2)
     (timeout 75 curl -s -N "http://127.0.0.1:7970/api/events?t=$TOK" > /tmp/sse.log &)
