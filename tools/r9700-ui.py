@@ -426,9 +426,19 @@ def _build_status(include_journal=True):
                 daemon_state[k.strip()] = v.strip()
     except OSError:
         pass
+    # Held-awake state: daemon writes state=ACTIVE_HELD with vram_used/gtt_total.
+    held_awake = None
+    if daemon_state.get("state") == "ACTIVE_HELD":
+        def _gb(key):
+            try:
+                return round(int(daemon_state[key]) / 1073741824, 1)
+            except (KeyError, ValueError):
+                return None
+        held_awake = {"vram_used_gb": _gb("vram_used"), "gtt_total_gb": _gb("gtt_total")}
     # Eviction risk is measured by the daemon only during active wake handling.
+    # Show it only when eviction_risk=1 AND not held (mutually exclusive).
     eviction_risk = None
-    if daemon_state.get("eviction_risk") == "1":
+    if daemon_state.get("eviction_risk") == "1" and not held_awake:
         def _gb(key):
             try:
                 return round(int(daemon_state[key]) / 1073741824, 1)
@@ -441,7 +451,7 @@ def _build_status(include_journal=True):
         "suspended_ms": suspended_ms, "control": control,
         "tuned": tuned, "live": live, "ranges": ranges,
         "service": svc, "state_file": state_text,
-        "daemon_state": daemon_state.get("state"), "eviction_risk": eviction_risk,
+        "daemon_state": daemon_state.get("state"), "held_awake": held_awake, "eviction_risk": eviction_risk,
         "sampling": {"mode": mode, "next_sensor_read_s": round(next_read_s, 2)},
     }
     if live is not None:

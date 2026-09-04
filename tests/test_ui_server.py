@@ -1023,3 +1023,127 @@ class TestPciDiscovery:
         sudo_calls = [c for c in fake_subprocess
                       if c["cmd"] and c["cmd"][0] == "sudo"]
         assert sudo_calls == []
+
+
+# ─── State file pill tests ────────────────────────────────────────────────────
+
+class TestEvictionPills:
+    """Test that the UI correctly renders held_awake vs eviction_risk pills
+    based on what the daemon writes to the state file."""
+
+    def test_held_awake_pill_when_state_active_held(self, fake_ui_tree, monkeypatch):
+        """When state=ACTIVE_HELD with vram_used/gtt_total, held_awake is populated."""
+        state_path = fake_ui_tree / "state"
+        state_path.write_text(
+            "pci=0000:aa:00.0\n"
+            "state=ACTIVE_HELD\n"
+            "vo=-25\n"
+            "vram_used=18253611008\n"  # 17.0 GB
+            "gtt_total=16106127360\n"  # 15.0 GB
+            "ts=1234567890\n"
+        )
+        payload = ui_mod._build_status(include_journal=False)
+        assert payload["held_awake"] == {"vram_used_gb": 17.0, "gtt_total_gb": 15.0}
+        assert payload["eviction_risk"] is None
+
+    def test_held_awake_pill_shows_gbs(self, fake_ui_tree, monkeypatch):
+        """held_awake correctly converts bytes to GB rounded to 1 decimal."""
+        state_path = fake_ui_tree / "state"
+        state_path.write_text(
+            "state=ACTIVE_HELD\n"
+            "vram_used=1234567890\n"
+            "gtt_total=9876543210\n"
+            "ts=1234567890\n"
+        )
+        payload = ui_mod._build_status(include_journal=False)
+        assert payload["held_awake"]["vram_used_gb"] == 1.1  # 1234567890 / 1e9 ≈ 1.2, rounded to 1.1
+        assert payload["held_awake"]["gtt_total_gb"] == 9.2  # 9876543210 / 1e9 ≈ 9.2
+
+    def test_eviction_risk_pill_only_when_not_held(self, fake_ui_tree, monkeypatch):
+        """When eviction_risk=1 but state != ACTIVE_HELD, show eviction_risk pill."""
+        state_path = fake_ui_tree / "state"
+        state_path.write_text(
+            "pci=0000:aa:00.0\n"
+            "state=ACTIVE_CONFIGURED\n"
+            "eviction_risk=1\n"
+            "vram_used=18253611008\n"  # 17.0 GB
+            "gtt_total=16106127360\n"  # 15.0 GB
+            "ts=1234567890\n"
+        )
+        payload = ui_mod._build_status(include_journal=False)
+        assert payload["held_awake"] is None
+        assert payload["eviction_risk"] == {
+            "unsafe_to_suspend": True,
+            "vram_used_gb": 17.0,
+            "gtt_total_gb": 15.0,
+        }
+
+    def test_never_both_pills_lit(self, fake_ui_tree, monkeypatch):
+        """Never show both held_awake and eviction_risk pills at once.
+        When state=ACTIVE_HELD, eviction_risk must be None."""
+        state_path = fake_ui_tree / "state"
+        state_path.write_text(
+            "pci=0000:aa:00.0\n"
+            "state=ACTIVE_HELD\n"
+            "eviction_risk=1\n"
+            "vram_used=18253611008\n"
+            "gtt_total=16106127360\n"
+            "ts=1234567890\n"
+        )
+        payload = ui_mod._build_status(include_journal=False)
+        # held_awake takes precedence; eviction_risk must be None
+        assert payload["held_awake"] is not None
+        assert payload["eviction_risk"] is None
+
+    def test_no_pills_when_no_held_or_risk(self, fake_ui_tree, monkeypatch):
+        """When state != ACTIVE_HELD and eviction_risk != 1, both are None."""
+        state_path = fake_ui_tree / "state"
+        state_path.write_text(
+            "pci=0000:aa:00.0\n"
+            "state=ACTIVE_CONFIGURED\n"
+            "vo=-25\n"
+            "ts=1234567890\n"
+        )
+        payload = ui_mod._build_status(include_journal=False)
+        assert payload["held_awake"] is None
+        assert payload["eviction_risk"] is None
+
+    def test_held_awake_with_missing_values(self, fake_ui_tree, monkeypatch):
+        """held_awake still works if vram_used/gtt_total are missing or invalid."""
+        state_path = fake_ui_tree / "state"
+        state_path.write_text(
+            "state=ACTIVE_HELD\n"
+            "ts=1234567890\n"
+        )
+        payload = ui_mod._build_status(include_journal=False)
+        assert payload["held_awake"] == {"vram_used_gb": None, "gtt_total_gb": None}
+
+    def test_eviction_risk_with_missing_values(self, fake_ui_tree, monkeypatch):
+        """eviction_risk still works if vram_used/gtt_total are missing or invalid."""
+        state_path = fake_ui_tree / "state"
+        state_path.write_text(
+            "state=ACTIVE_CONFIGURED\n"
+            "eviction_risk=1\n"
+            "ts=1234567890\n"
+        )
+        payload = ui_mod._build_status(include_journal=False)
+        assert payload["eviction_risk"] == {
+            "unsafe_to_suspend": True,
+            "vram_used_gb": None,
+            "gtt_total_gb": None,
+        }
+
+    def test_eviction_risk_ignored_when_zero(self, fake_ui_tree, monkeypatch):
+        """eviction_risk=0 does not trigger the pill."""
+        state_path = fake_ui_tree / "state"
+        state_path.write_text(
+            "state=ACTIVE_CONFIGURED\n"
+            "eviction_risk=0\n"
+            "vram_used=18253611008\n"
+            "gtt_total=16106127360\n"
+            "ts=1234567890\n"
+        )
+        payload = ui_mod._build_status(include_journal=False)
+        assert payload["eviction_risk"] is None
+        assert payload["held_awake"] is None
+
