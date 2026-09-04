@@ -357,23 +357,22 @@ def _build_status(include_journal=True):
                 daemon_state[k.strip()] = v.strip()
     except OSError:
         pass
-    # Evict guard (daemon holds the card awake when VRAM in use exceeds what
-    # amdgpu can stage into GTT for a D3cold cycle). Pure state-file read.
-    hold = None
-    if daemon_state.get("state") == "ACTIVE_HELD":
+    # Eviction risk is measured by the daemon only during active wake handling.
+    eviction_risk = None
+    if daemon_state.get("eviction_risk") == "1":
         def _gb(key):
             try:
                 return round(int(daemon_state[key]) / 1073741824, 1)
             except (KeyError, ValueError):
                 return None
-        hold = {"vram_used_gb": _gb("vram_used"), "gtt_total_gb": _gb("gtt_total")}
+        eviction_risk = {"unsafe_to_suspend": True, "vram_used_gb": _gb("vram_used"), "gtt_total_gb": _gb("gtt_total")}
 
     payload = {
         "ts": ts, "pci": pci, "runtime_status": rs, "power_state": ps,
         "suspended_ms": suspended_ms, "control": control,
         "tuned": tuned, "live": live, "ranges": ranges,
         "service": svc, "state_file": state_text,
-        "daemon_state": daemon_state.get("state"), "hold": hold,
+        "daemon_state": daemon_state.get("state"), "eviction_risk": eviction_risk,
         "sampling": {"mode": mode, "next_sensor_read_s": round(next_read_s, 2)},
     }
     if live is not None:

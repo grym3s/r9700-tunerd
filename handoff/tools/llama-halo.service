@@ -4,12 +4,13 @@ After=default.target
 
 [Service]
 Type=simple
+Environment=MESA_VK_DEVICE_SELECT=1002:1586!
 ExecStart=%h/.local/opt/llama.cpp/llama-b10784/llama-server \
   -m "/run/media/grymes/T9/AI Folders/LM Studio Models/lmstudio-community/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q6_K.gguf" \
   -md "/run/media/grymes/T9/AI Folders/LM Studio Models/incoai/Qwen3.8-27B-DFlash2-GGUF/Qwen3.8-27B-DFlash2-Q4_K_M.gguf" \
   --spec-type draft-dflash --spec-draft-n-max 4 \
-  --device Vulkan1 --spec-draft-device Vulkan1 -ngl all -ngld all \
-  -c 65536 -fa on --jinja --alias qwen3.8-27b-q6 \
+  --device Vulkan0 --spec-draft-device Vulkan0 -ngl all -ngld all \
+  -c 131072 -ctk q8_0 -ctv q8_0 -fa on --reasoning-budget 8192 --jinja --alias qwen3.8-27b-q6 \
   --host 127.0.0.1 --port 1235 --parallel 1
 Restart=on-failure
 RestartSec=5

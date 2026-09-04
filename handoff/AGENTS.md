@@ -125,8 +125,11 @@ that advertise < 64 K context, which is why Halo's server runs `-c 65536`.
 - User unit: `~/.config/systemd/user/llama-halo.service` (copy in
   `tools/llama-halo.service`), enabled, port 1235, alias `qwen3.8-27b-q6`.
   Flags: `--device Vulkan1 --spec-draft-device Vulkan1 -ngl all -ngld all
-  --spec-type draft-dflash --spec-draft-n-max 4 -c 65536 -fa on --jinja
-  --parallel 1`.
+  --spec-type draft-dflash --spec-draft-n-max 4 -c 131072 -ctk q8_0 -ctv q8_0
+  -fa on --reasoning-budget 8192 --jinja --parallel 1`. The 128K context
+  (q8 KV cache) is needed so a Hermes worker can hold the daemon + tests +
+  spec without compaction loops; the 8192-token reasoning budget was set by
+  the owner after one worker turn spent 20,059 tokens thinking (2026-09-04).
 - `Vulkan1` is the iGPU (`0x1002:0x1586`); `Vulkan0` is the R9700. If the
   device order ever changes, verify with `vulkaninfo --summary` before
   restarting the unit.
