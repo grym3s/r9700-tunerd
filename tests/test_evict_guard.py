@@ -206,3 +206,146 @@ def test_gtt_fallback_warns_once(tmp_path, monkeypatch):
 
     warnings = [r for r in records if r[0] == rt.syslog.LOG_WARNING]
     assert len(warnings) == 1
+
+
+# ---------------------------------------------------------------------------
+# Hold/release logic in cmd_watch + require_runtime_pm interaction
+# ---------------------------------------------------------------------------
+
+
+def _watch_conf_text(*, evict_guard=True, margin=0.5):
+    return (
+        "VENDOR=0x1002\n"
+        "DEVICE=0x7551\n"
+        "SUBSYSTEM_VENDOR=0x1043\n"
+        "SUBSYSTEM_DEVICE=0x0626\n"
+        "POWER_LIMIT_W=210\n"
+        "VOLTAGE_OFFSET_MV=0\n"
+        "POLL_INTERVAL_S=2\n"
+        f"EVICT_GUARD={1 if evict_guard else 0}\n"
+        f"EVICT_GUARD_MARGIN={margin}\n"
+    )
+
+
+@pytest.fixture(autouse=True)
+def _reset_evict_state(monkeypatch):
+    """Isolate the module-level _evict singleton between tests."""
+    fresh = rt._EvictGuardState()
+    monkeypatch.setattr(rt, "_evict", fresh)
+    yield
+
+
+def _run_one_watch_iteration(conf, monkeypatch, tmp_path, *, evict_guard=True, margin=0.5):
+    """Drive cmd_watch through exactly one polling-loop iteration, then stop."""
+    conf_file = tmp_path / "watch.conf"
+    conf_file.write_text(_watch_conf_text(evict_guard=evict_guard, margin=margin))
+    monkeypatch.setattr(rt, "CONF_PATH", conf_file)
+
+    rt._stop = False
+    rt._last_pm_refusal = None
+    rt._last_kernel_scan = 0.0
+
+    # handle_wake is a no-op here — status is already "active" so the
+    # initial pre-loop block runs it once; keep it harmless & cheap.
+    monkeypatch.setattr(rt, "handle_wake", lambda p, c, cc: True)
+
+    sleep_count = 0
+
+    def fake_sleep(*args, **kwargs):
+        nonlocal sleep_count
+        sleep_count += 1
+        if sleep_count == 1:
+            rt._stop = True
+
+    monkeypatch.setattr(rt.time, "sleep", fake_sleep)
+    result = rt.cmd_watch(conf)
+    assert result == 0
+
+
+def test_evict_guard_hold_trigger(fake_tree, conf, monkeypatch, tmp_path):
+    pci = fake_tree / "0000:aa:00.0"
+    (pci / "mem_info_gtt_total").write_text("1000\n")  # gtt = 1000 bytes
+    # margin=0.5 -> hold threshold = 500 bytes; VRAM well above it.
+    monkeypatch.setattr(rt, "drm_vram_in_use", lambda pci_addr: 900)
+
+    _run_one_watch_iteration(conf, monkeypatch, tmp_path, margin=0.5)
+
+    assert (pci / "power" / "control").read_text().strip().startswith("on")
+    assert rt._evict.holding is True
+    state_text = (rt.STATE_DIR / "state").read_text()
+    assert "state=ACTIVE_HELD" in state_text
+    assert "vram_used=900" in state_text
+    assert "gtt_total=1000" in state_text
+
+
+def test_evict_guard_release_trigger(fake_tree, conf, monkeypatch, tmp_path):
+    pci = fake_tree / "0000:aa:00.0"
+    (pci / "mem_info_gtt_total").write_text("1000\n")
+    (pci / "power" / "control").write_text("on\n")
+    rt._evict.holding = True
+    # margin=0.5 -> release threshold = 0.8*0.5*1000 = 400; VRAM well below it.
+    monkeypatch.setattr(rt, "drm_vram_in_use", lambda pci_addr: 100)
+
+    _run_one_watch_iteration(conf, monkeypatch, tmp_path, margin=0.5)
+
+    assert (pci / "power" / "control").read_text().strip().startswith("auto")
+    assert rt._evict.holding is False
+    state_text = (rt.STATE_DIR / "state").read_text()
+    assert "state=ACTIVE_CONFIGURED" in state_text
+
+
+def test_evict_guard_hysteresis_no_release(fake_tree, conf, monkeypatch, tmp_path):
+    """VRAM between 0.8*margin*gtt and margin*gtt must NOT release while holding."""
+    pci = fake_tree / "0000:aa:00.0"
+    (pci / "mem_info_gtt_total").write_text("1000\n")
+    (pci / "power" / "control").write_text("on\n")
+    rt._evict.holding = True
+    # margin=0.5 -> hold=500, release=400; pick 450 (in the hysteresis band).
+    monkeypatch.setattr(rt, "drm_vram_in_use", lambda pci_addr: 450)
+
+    _run_one_watch_iteration(conf, monkeypatch, tmp_path, margin=0.5)
+
+    assert (pci / "power" / "control").read_text().strip().startswith("on")
+    assert rt._evict.holding is True
+
+
+def test_require_runtime_pm_passes_when_guard_holding(fake_tree, conf):
+    pci = fake_tree / "0000:aa:00.0"
+    (pci / "power" / "control").write_text("on\n")
+    rt._evict.holding = True
+    rt.require_runtime_pm(pci)  # must not raise
+
+
+def test_require_runtime_pm_still_refuses_when_not_holding(fake_tree, conf):
+    pci = fake_tree / "0000:aa:00.0"
+    (pci / "power" / "control").write_text("on\n")
+    rt._evict.holding = False
+    with pytest.raises(RuntimeError):
+        rt.require_runtime_pm(pci)
+
+
+def test_evict_guard_never_reads_vram_gtt_while_not_active(
+    fake_tree, conf, monkeypatch, tmp_path
+):
+    """VRAM/GTT reads must only happen on an 'active' poll, never otherwise."""
+    pci = fake_tree / "0000:aa:00.0"
+    (pci / "power" / "runtime_status").write_text("suspended\n")
+    (pci / "mem_info_gtt_total").write_text("1000\n")
+
+    calls = {"vram": 0, "gtt": 0}
+
+    def _tracked_vram(pci_addr):
+        calls["vram"] += 1
+        return 0
+
+    def _tracked_gtt(p):
+        calls["gtt"] += 1
+        return 1000
+
+    monkeypatch.setattr(rt, "drm_vram_in_use", _tracked_vram)
+    monkeypatch.setattr(rt, "gtt_total_bytes", _tracked_gtt)
+
+    _run_one_watch_iteration(conf, monkeypatch, tmp_path, margin=0.5)
+
+    assert calls["vram"] == 0
+    assert calls["gtt"] == 0
