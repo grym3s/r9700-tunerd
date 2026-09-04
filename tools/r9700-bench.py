@@ -102,15 +102,33 @@ class GpuSysfs:
         self.hwmon = self._find_hwmon()
 
     def _find_hwmon(self) -> Path | None:
-        """Select hwmon directory the same way the daemon's hwmon_dir() does:
-        sorted children, first one whose name starts with 'hwmon'."""
+        """Select the R9700 hwmon: numeric hwmonN ordering, prefer a
+        candidate that contains power1_cap, ignore malformed names."""
         hroot = self.pci / "hwmon"
-        if not hroot.is_dir():
+        try:
+            if not hroot.is_dir():
+                return None
+            children = sorted(hroot.iterdir(), key=lambda c: self._hwmon_sort_key(c.name))
+        except OSError:
             return None
-        for child in sorted(hroot.iterdir()):
-            if child.name.startswith("hwmon"):
+        best: Path | None = None
+        for child in children:
+            if not re.fullmatch(r"hwmon\d+", child.name):
+                continue
+            if child.is_dir() and (child / "power1_cap").is_file():
                 return child
-        return None
+            if best is None:
+                best = child
+        return best
+
+    @staticmethod
+    def _hwmon_sort_key(name: str) -> tuple[int, int, str]:
+        """Numeric hwmonN ordering (hwmon2 < hwmon10 < hwmon12); malformed
+        names sort after all numeric ones."""
+        m = re.fullmatch(r"hwmon(\d+)", name)
+        if not m:
+            return (1, 0, name)
+        return (0, int(m.group(1)), name)
 
     @staticmethod
     def _read(path: Path) -> str | None:
