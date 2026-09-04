@@ -75,7 +75,7 @@ def _spawn_ui(port: int) -> tuple[Optional[str], Optional[subprocess.Popen]]:
     proc = subprocess.Popen(
         [sys.executable, str(UI_SCRIPT), "--port", str(port)],
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-        text=True, cwd=str(REPO_ROOT))
+        text=True, cwd=str(REPO_ROOT), preexec_fn=_die_with_parent)
     token: Optional[str] = None
     got = threading.Event()
 
@@ -93,6 +93,21 @@ def _spawn_ui(port: int) -> tuple[Optional[str], Optional[subprocess.Popen]]:
         _kill(proc)
         return None, None
     return token, proc
+
+
+def _die_with_parent() -> None:
+    """Child preexec: ask the kernel to SIGTERM us when the parent dies.
+
+    This makes server cleanup independent of the parent's main loop: even if
+    the app is SIGKILLed or hangs and gets killed, no server is orphaned.
+    """
+    try:
+        import ctypes
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        PR_SET_PDEATHSIG = 1
+        libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM, 0, 0, 0)
+    except Exception:
+        pass  # best effort; atexit cleanup still covers normal exits
 
 
 def _kill(proc: Optional[subprocess.Popen]) -> None:
@@ -187,10 +202,13 @@ class R9700App:
         self.win.add(self.web)
 
         # ── cleanup on every exit path ─────────────────────────────────
-        # GLib-integrated handlers: a plain signal.signal() handler would not
-        # run while Gtk.main() is blocked inside C.
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            GLib.unix_signal_add(GLib.PRIORITY_HIGH, sig, self._on_signal)
+        # Deliberately NO SIGTERM/SIGINT handlers. Two instances were observed
+        # with the GTK main thread stuck in a futex wait; a GLib signal
+        # handler never runs in that state, so the window ignored SIGTERM and
+        # systemd/Hyprland had to SIGKILL it. With the default disposition the
+        # kernel terminates us immediately, and a spawned server child is
+        # torn down by PR_SET_PDEATHSIG (see _spawn_ui). Window close and
+        # Ctrl+Q still go through quit() for the graceful path.
 
         self.win.show_all()
         # Attached to the user unit (not our own child): the unit's token
@@ -288,10 +306,6 @@ class R9700App:
     def quit(self) -> None:
         self._cleanup()
         Gtk.main_quit()
-
-    def _on_signal(self) -> bool:
-        self.quit()
-        return GLib.SOURCE_REMOVE
 
     # ── keyboard ───────────────────────────────────────────────────────
 
