@@ -6,6 +6,7 @@ Binds 127.0.0.1:7970.  All privileged ops go through
 Never opens /dev/dri, never writes sysfs, never wakes the card.
 """
 import argparse
+import csv
 import errno
 import json
 import math
@@ -27,13 +28,21 @@ RANGES_CACHE = Path("/run/r9700-tunerd/ranges.json")
 STATE_FILE = Path("/run/r9700-tunerd/state")
 BENCH_DIR = Path("~/r9700-bench").expanduser()
 BENCH_SCRIPT = Path(__file__).resolve().parent / "r9700-bench.py"
-UI_HTML = Path(__file__).resolve().parent.parent / "ui" / "index.html"
+REPO_ROOT = Path(__file__).resolve().parent.parent
+UI_HTML = REPO_ROOT / "ui" / "index.html"
+MATRIX_DOC = REPO_ROOT / "docs" / "MATRIX-2026-09-04.md"
+RESULTS_DIR = REPO_ROOT / "docs" / "results"
 DAEMON_CLI = "/usr/local/sbin/r9700-tunerd"
 BENCH_ENDPOINT = "http://127.0.0.1:1234/v1"
 BENCH_MODEL = "qwen/qwen3.8-27b@q4_k_m"
 PCI_DEVICES_ROOT = Path("/sys/bus/pci/devices")
 
 MAX_BODY_BYTES = 65536
+
+# Named profiles the daemon understands (mirrors r9700-tunerd's PROFILE_NAMES;
+# used only for a fast pre-check before the CLI call, never as the source of
+# truth — list-profiles --json is the source of truth for names/values).
+KNOWN_PROFILE_NAMES = ("EFFICIENCY", "BALANCED", "PERFORMANCE")
 
 TOKEN = ""
 GPU = None
@@ -290,6 +299,78 @@ def _hwmon_w(name):
     return int(v) / 1_000_000 if v is not None else None
 
 
+# ─── Fan-curve parsing (mirrors r9700-tunerd's parse_fan_curve; pure, no I/O) ──
+
+_FAN_POINT_RANGES = {"temp": (0, 110), "pwm": (0, 100)}
+
+
+def _parse_curve_str(raw):
+    """Parse a "temp:pwm,temp:pwm,..." string into a list of [temp, pwm]
+    pairs sorted by temp, or None if raw is empty/unparsable. Used only for
+    display (the daemon is the authority on validity via set-fan-curve)."""
+    text = (raw or "").strip()
+    if not text:
+        return None
+    points = []
+    for chunk in text.split(","):
+        chunk = chunk.strip()
+        if not chunk or ":" not in chunk:
+            continue
+        t_raw, p_raw = chunk.split(":", 1)
+        try:
+            points.append([float(t_raw.strip()), float(p_raw.strip())])
+        except ValueError:
+            continue
+    if not points:
+        return None
+    points.sort(key=lambda pt: pt[0])
+    return points
+
+
+def _validate_fan_curve_points(points):
+    """Mirror the daemon's parse_fan_curve validation rules (monotonic,
+    2+ points, ranges). Returns a list of problem strings (empty = valid).
+    This is belt-and-suspenders only: the server never trusts this result
+    to skip the daemon's own independent validation in set-fan-curve."""
+    problems = []
+    if not isinstance(points, list) or len(points) < 2:
+        return ["at least two points are required"]
+    parsed = []
+    for pt in points:
+        if (not isinstance(pt, (list, tuple)) or len(pt) != 2
+                or isinstance(pt[0], bool) or isinstance(pt[1], bool)
+                or not isinstance(pt[0], (int, float))
+                or not isinstance(pt[1], (int, float))):
+            problems.append(f"point {pt!r} is not [temp, pwm]")
+            continue
+        t, p = float(pt[0]), float(pt[1])
+        if t < 0 or t > 110:
+            problems.append(f"temp {t} out of range 0..110")
+            continue
+        if p < 0 or p > 100:
+            problems.append(f"pwm {p} out of range 0..100")
+            continue
+        parsed.append((t, p))
+    if problems:
+        return problems
+    parsed.sort(key=lambda pt: pt[0])
+    temps = [t for t, _ in parsed]
+    if len(set(temps)) != len(temps):
+        return ["duplicate temperature points"]
+    for i in range(1, len(parsed)):
+        if parsed[i][0] <= parsed[i - 1][0]:
+            return ["temp points must be strictly increasing"]
+        if parsed[i][1] < parsed[i - 1][1]:
+            return ["pwm points must be monotonically non-decreasing with temp"]
+    return []
+
+
+def _points_to_curve_str(points):
+    def _fmt(x):
+        return str(int(x)) if float(x).is_integer() else str(x)
+    return ",".join(f"{_fmt(t)}:{_fmt(p)}" for t, p in points)
+
+
 # ─── Sensor block reader (extracted for adaptive sampling) ──────────────────
 
 def _read_sensors():
@@ -322,6 +403,10 @@ def _read_sensors():
         live[key] = int(v) / 1000 if v is not None else None
     v = GPU.read_hwmon("fan1_input")
     live["fan_rpm"] = int(v) if v is not None else None
+    pwm_raw = GPU.read_hwmon("pwm1")
+    live["fan_pwm_pct"] = round(int(pwm_raw) / 255.0 * 100.0, 1) if pwm_raw is not None else None
+    pwm_mode = GPU.read_hwmon("pwm1_enable")
+    live["fan_mode"] = ("manual" if pwm_mode == "1" else "firmware") if pwm_mode is not None else None
     sclk = GPU.read_active("pp_dpm_sclk")
     live["sclk_mhz"] = _parse_dpm_clock(sclk) if sclk else None
     mclk = GPU.read_active("pp_dpm_mclk")
@@ -446,6 +531,24 @@ def _build_status(include_journal=True):
                 return None
         eviction_risk = {"unsafe_to_suspend": True, "vram_used_gb": _gb("vram_used"), "gtt_total_gb": _gb("gtt_total")}
 
+    # Fan block: config (always PM-safe, disk read only) plus live pwm/rpm
+    # taken from the same `live` sensor dict built above under the same
+    # active-only gate — no extra hwmon reads are ever made here.
+    def _safe_float(raw, default):
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return default
+    fan = {
+        "enabled": bool(CONFIG.get("FAN_CURVE_ENABLED") in ("1", "true", "True")),
+        "curve": CONFIG.get("FAN_CURVE") or None,
+        "points": _parse_curve_str(CONFIG.get("FAN_CURVE") or ""),
+        "hysteresis_c": _safe_float(CONFIG.get("FAN_HYSTERESIS_C"), 3.0),
+        "mode": live.get("fan_mode") if live else None,
+        "pwm_pct": live.get("fan_pwm_pct") if live else None,
+        "rpm": live.get("fan_rpm") if live else None,
+    }
+
     payload = {
         "ts": ts, "pci": pci, "runtime_status": rs, "power_state": ps,
         "suspended_ms": suspended_ms, "control": control,
@@ -453,6 +556,7 @@ def _build_status(include_journal=True):
         "service": svc, "state_file": state_text,
         "daemon_state": daemon_state.get("state"), "held_awake": held_awake, "eviction_risk": eviction_risk,
         "sampling": {"mode": mode, "next_sensor_read_s": round(next_read_s, 2)},
+        "fan": fan,
     }
     if live is not None:
         payload["live_age_s"] = round(age_s, 2) if age_s is not None else 0.0
@@ -556,6 +660,126 @@ def _list_bench():
     return results
 
 
+# ─── Matrix results (read-only parse of docs/MATRIX-*.md + docs/results/*) ──
+
+_MD_TABLE_ROW_RE = re.compile(r"^\|(.+)\|\s*$")
+_MD_HEADER_SEP_RE = re.compile(r"^[\s|:-]+$")
+
+# Canonical column names the UI understands, keyed by a normalized (lower,
+# stripped, non-alnum removed) match against the markdown header cell.
+_MD_COLUMN_ALIASES = {
+    "offsetmv": "offset_mv",
+    "capw": "cap_w",
+    "gentoks": "gen_tok_s",
+    "aggtoks": "agg_tok_s",
+    "meanw": "mean_w",
+    "toksw": "tok_s_per_w",
+    "tjmaxc": "max_junction_c",
+    "errors": "errors",
+    "d3colds": "d3cold_s",
+    "verdict": "verdict",
+}
+
+
+def _norm_col(cell):
+    return re.sub(r"[^a-z0-9]", "", cell.strip().lower())
+
+
+def _num(cell):
+    cell = cell.strip()
+    if cell == "" or cell == "—":
+        return None
+    try:
+        if re.fullmatch(r"-?\d+", cell):
+            return int(cell)
+        return float(cell)
+    except ValueError:
+        return cell  # non-numeric column (e.g. verdict) passes through as text
+
+
+def _parse_markdown_matrix(text, source):
+    """Parse every pipe-table in a markdown doc into row dicts.
+
+    Tolerant of any pipe table whose header cells match the known column
+    aliases (order-independent); tables with no recognised columns are
+    skipped. Returns a list of dicts, each carrying "source".
+    """
+    rows = []
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        m = _MD_TABLE_ROW_RE.match(lines[i])
+        if not m or i + 1 >= len(lines) or not _MD_HEADER_SEP_RE.match(lines[i + 1]):
+            i += 1
+            continue
+        header_cells = [c.strip() for c in m.group(1).split("|")]
+        cols = [_MD_COLUMN_ALIASES.get(_norm_col(c)) for c in header_cells]
+        if not any(cols):
+            i += 2
+            continue
+        j = i + 2
+        while j < len(lines):
+            rm = _MD_TABLE_ROW_RE.match(lines[j])
+            if not rm:
+                break
+            cells = [c.strip().rstrip("*").strip() for c in rm.group(1).split("|")]
+            row = {"source": source}
+            for col, cell in zip(cols, cells):
+                if col is None:
+                    continue
+                row[col] = _num(cell) if col != "verdict" else cell
+            if len(row) > 1:
+                rows.append(row)
+            j += 1
+        i = j
+    return rows
+
+
+def _parse_results_csv(path):
+    rows = []
+    try:
+        with path.open(newline="") as f:
+            reader = csv.DictReader(f)
+            for raw in reader:
+                row = {"source": str(path.relative_to(REPO_ROOT))}
+                for k, v in raw.items():
+                    if k is None:
+                        continue
+                    key = _MD_COLUMN_ALIASES.get(_norm_col(k), k.strip())
+                    row[key] = _num(v) if v is not None else None
+                rows.append(row)
+    except (OSError, csv.Error):
+        return []
+    return rows
+
+
+def _list_matrix_results():
+    """Server-side parse of docs/MATRIX-*.md and docs/results/*. Read-only,
+    no rerun. Returns a flat list of per-run dicts."""
+    rows = []
+    if MATRIX_DOC.is_file():
+        try:
+            text = MATRIX_DOC.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            text = ""
+        if text:
+            rows.extend(_parse_markdown_matrix(text, MATRIX_DOC.name))
+    if RESULTS_DIR.is_dir():
+        for p in sorted(RESULTS_DIR.rglob("*")):
+            if not p.is_file():
+                continue
+            rel = str(p.relative_to(REPO_ROOT))
+            if p.suffix.lower() == ".csv":
+                rows.extend(_parse_results_csv(p))
+            elif p.suffix.lower() == ".md":
+                try:
+                    text = p.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                rows.extend(_parse_markdown_matrix(text, rel))
+    return rows
+
+
 # ─── HTTP handler ────────────────────────────────────────────────────────────
 
 class Handler(BaseHTTPRequestHandler):
@@ -642,6 +866,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._api_bench_status()
             elif path == "/api/profiles":
                 self._api_profiles()
+            elif path == "/api/named-profiles":
+                self._api_named_profiles()
+            elif path == "/api/matrix":
+                self._json(200, _list_matrix_results())
             else:
                 self._err(404, "unknown endpoint")
         else:
@@ -726,6 +954,24 @@ class Handler(BaseHTTPRequestHandler):
                     break
         self._json(200, profiles)
 
+    def _api_named_profiles(self):
+        if not self._auth_ok():
+            self._err(403, "invalid or missing token")
+            return
+        # Source of truth: the daemon's list-profiles --json. Never
+        # hardcoded on the UI side, so a profile-engine change is picked
+        # up without touching this file.
+        step = self._run_cli("list-profiles", "--json")
+        if step["rc"] != 0:
+            self._err(502, f"list-profiles failed: {step['stderr'] or step['stdout']}")
+            return
+        try:
+            data = json.loads(step["stdout"])
+        except (ValueError, json.JSONDecodeError):
+            self._err(502, "list-profiles returned invalid JSON")
+            return
+        self._json(200, data)
+
     # ── POST ──
 
     def do_POST(self):
@@ -736,7 +982,8 @@ class Handler(BaseHTTPRequestHandler):
         if not self._auth_ok():
             self._err(403, "invalid or missing token")
             return
-        if path not in ("/api/set", "/api/reset", "/api/apply", "/api/bench/run"):
+        if path not in ("/api/set", "/api/reset", "/api/apply", "/api/bench/run",
+                        "/api/set-profile", "/api/set-fan-curve"):
             self._err(404, "unknown endpoint")
             return
         # Serialize mutations (set/apply/reset/bench run): a concurrent
@@ -755,6 +1002,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._api_apply()
             elif path == "/api/bench/run":
                 self._api_bench_run()
+            elif path == "/api/set-profile":
+                self._api_set_profile()
+            elif path == "/api/set-fan-curve":
+                self._api_set_fan_curve()
         finally:
             MUT_LOCK.release()
 
@@ -820,6 +1071,60 @@ class Handler(BaseHTTPRequestHandler):
 
     def _api_apply(self):
         step = self._run_cli("apply")
+        self._json(200, {"ok": step["rc"] == 0, "steps": [step]})
+
+    def _api_set_profile(self):
+        body = self._check_post()
+        if body is None:
+            return
+        if not isinstance(body, dict):
+            self._err(400, "body must be a JSON object")
+            return
+        unknown = set(body) - {"name"}
+        if unknown:
+            self._err(400, f"unknown field(s): {', '.join(sorted(unknown))}")
+            return
+        name = body.get("name")
+        if not isinstance(name, str) or name.strip().upper() not in KNOWN_PROFILE_NAMES:
+            self._err(400, f"name must be one of {'/'.join(KNOWN_PROFILE_NAMES)}")
+            return
+        # Whole-request validation done; only now may the CLI run. The
+        # daemon independently re-validates and rejects an unknown name.
+        step = self._run_cli("set-profile", name.strip().upper())
+        self._json(200, {"ok": step["rc"] == 0, "steps": [step]})
+
+    def _api_set_fan_curve(self):
+        body = self._check_post()
+        if body is None:
+            return
+        if not isinstance(body, dict):
+            self._err(400, "body must be a JSON object")
+            return
+        unknown = set(body) - {"points", "off"}
+        if unknown:
+            self._err(400, f"unknown field(s): {', '.join(sorted(unknown))}")
+            return
+        off = body.get("off", False)
+        if not isinstance(off, bool):
+            self._err(400, "off must be a boolean")
+            return
+        if off:
+            step = self._run_cli("set-fan-curve", "--off")
+            self._json(200, {"ok": step["rc"] == 0, "steps": [step]})
+            return
+        points = body.get("points")
+        if points is None:
+            self._err(400, "provide points (list of [temp, pwm]) or off=true")
+            return
+        # Client-side rules mirrored here so a bad curve never reaches the
+        # daemon subprocess, but the daemon's own set-fan-curve is still
+        # the sole authority: it re-parses and re-validates independently.
+        problems = _validate_fan_curve_points(points)
+        if problems:
+            self._err(400, "invalid fan curve: " + "; ".join(problems))
+            return
+        curve_str = _points_to_curve_str([(float(t), float(p)) for t, p in points])
+        step = self._run_cli("set-fan-curve", curve_str)
         self._json(200, {"ok": step["rc"] == 0, "steps": [step]})
 
     def _api_bench_run(self):
