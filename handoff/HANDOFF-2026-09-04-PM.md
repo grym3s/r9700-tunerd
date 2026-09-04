@@ -175,3 +175,17 @@ Re-arm both after boot if the session continues.
   `r9700-tunerd status` while the card is active, hold the card awake.
   `pgrep -f`/`pkill -f` self-match bit the orchestrator again; use `ps | grep "[p]attern"`.
 - Halo's server is running again; LM Studio server stopped; Ray's model unloaded.
+
+## 8. Project folders separated (owner, 18:40)
+
+The owner ruled that this tuner and DriverSense are separate projects with
+separate folders. From now on tuner sessions are opened in
+`~/src/r9700-tunerd` (Claude project memory now lives at
+`~/.claude/projects/-home-grymes-src-r9700-tunerd/memory`, seeded with the
+tuner history, LM Studio/DFlash notes, Hermes team rules and the Omarchy
+desktop notes). Hermes board `r9700-tunerd` is this project's; DriverSense
+has its own board `driversense`. Nothing in this repo references the other
+project except `handoff/AGENTS.md` (history of the Windows DSH profile).
+
+R0.1 close-out still pending from §7: native-app soak + lifecycle (steps 3–4)
+and the reboot check (step 8) in `docs/ACCEPTANCE-R0.1.md`; card `t_14f696cd`.
