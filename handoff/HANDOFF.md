@@ -329,11 +329,29 @@ model uses ~27 GB of it, so 64 GB is ample. Until that is done: do not load
 Ray's model on the R9700, or the next sleep/wake will hang the machine
 again. `lms ps` shows it is not loaded on the current boot.
 
-Hardening to add to the daemon (next task for Ray, Halo reviews): at each
-wake, if `mem_info_vram_used > mem_info_gtt_total` (both readable while
-active), log a loud warning that the card cannot safely suspend with this
-much VRAM in use, and surface it in the dashboard state pill. Do not change
-runtime-PM behaviour automatically.
+Owner decision (2026-09-04 ~14:50, after being offered A: BIOS back to
+64 GB, B: daemon holds the card awake while VRAM > stageable GTT, C: smaller
+model): **"I think option B is best, I prefer automating these practises"**
+and then "build it". So the daemon DOES change runtime PM automatically,
+under a narrow rule: hold (`power/control=on`) only while VRAM in use exceeds
+the margin of GTT, release (`auto`) as soon as it drops, adopt an existing
+hold on restart, release on stop/ExecStopPost. This supersedes the earlier
+"warning only" sentence that stood here and that the Codex handoff
+(`handoff/CODEX-HANDOFF-2026-09-04.md`) relied on when it called the design
+obsolete. The build is on the Hermes board `r9700-tunerd` as four child
+cards on branch `wt/evict-guard` (Sonnet builds a–c, Haiku d), review on
+Ray after the guard is installed, acceptance on Forge.
+
+Attribution note: commits `549be3f` and `5ca0071` were made with `git add
+-A` while a Codex session had uncommitted files in the same checkout; they
+therefore include the Codex agent's warning-only UI edits (`eviction_risk`
+key in `tools/r9700-ui.py` / `ui/index.html`) and
+`handoff/CODEX-HANDOFF-2026-09-04.md`. Those are Codex's work, not the
+orchestrator's. The UI now has both the `ACTIVE_HELD` pill (d257764) and the
+`eviction_risk` pill; they must be reconciled once the daemon lands. The
+umbrella worktree `.worktrees/t_edfe740a` (Halo's 46-line partial, the
+warning-only snapshot) was removed by the orchestrator to free the shared
+branch; its logic is a subset of card (a)–(c).
 
 ## 6. What was fixed in Ray's app before/after Halo's review
 
