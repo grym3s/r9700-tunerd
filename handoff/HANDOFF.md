@@ -198,12 +198,30 @@ What to do next (cheapest first):
 4. Only after step 1 is clean should the app be considered released; until
    then the browser dashboard is the safe path.
 
-A second caveat: one app instance started from the orchestrator's sandboxed
-shell hung before entering the GTK main loop (main thread in a futex wait,
-no WebKit child processes, ignored SIGTERM). That never happened when
-launched via `systemd-run --user` or the menu. Likely a WebKit
-process-sandbox interaction inside the Claude tool sandbox, not a user-facing
-path, but it is unexplained.
+### 5b. Second open issue: GTK main thread stuck in a futex wait (seen twice)
+
+Two app instances ended with the main thread in `futex_do_wait` (19 threads,
+no GLib poll): one launched from the orchestrator's sandboxed shell (never
+showed a window), and one launched from the app menu at 10:45 that had
+rendered the dashboard normally before it got stuck. In that state a
+GLib-installed signal handler never runs, so SIGTERM was a no-op: Hyprland
+raised an "Application Not Responding" dialog and systemd needed its 90 s
+SIGKILL. A third instance launched at 10:58 stayed healthy (main thread in
+`poll`). Reproduction is unknown; the suspects are a synchronous WebKit IPC
+wait or a GLib/dconf lock on startup.
+
+Mitigation shipped (commit `0ef5a98`): the app installs **no** signal
+handlers, so the kernel's default disposition terminates it instantly even
+when hung, and a server child it spawned is torn down by
+`PR_SET_PDEATHSIG` rather than by parent code. Graceful cleanup (window size,
+child SIGTERM) still runs on window close and Ctrl+Q via `atexit`.
+
+Also shipped (commit `15578f7`): when attached to `r9700-ui.service` the app
+re-reads the unit's journal every 10 s and reloads on a token change, so a
+server restart no longer strands the window with 403s (verified: restart at
+10:59:10, window reloaded at 10:59:14). The owner's screenshot with "Apply
+error: invalid or missing token" and "range: live values not yet known" was
+exactly that stranded state on a pre-fix window.
 
 ## 6. What was fixed in Ray's app before/after Halo's review
 
