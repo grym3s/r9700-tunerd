@@ -11,7 +11,10 @@ validated on the live card.
    to reboot.
 3. **Real-workload validation** (first measurement done at -25 mV / 210 W; harness v3) – the user's llama-server / Qwen workload:
    stability, VO, power, hotspot, clocks, tokens/s, tokens/s/W, D3cold recovery.
-4. **Undervolt characterisation** – automated benchmark/results harness;
+4. **Undervolt characterisation** (first pass DONE 2026-09-04 at 210 W, docs/MATRIX-2026-09-04.md:
+   -25/-50/-75/-100 mV all PASS, the gain is entirely at -50 mV (+4.8 %), flat beyond;
+   safe point left at -25 mV, -50 mV recommended pending owner adoption; next: caps 230/250 W,
+   randomised repeats with cool-down, longer soak) – automated benchmark/results harness;
    -50/-75/-100 mV candidates; objective is best sustained throughput per watt with
    zero instability, not the largest offset. Then EFFICIENCY / BALANCED /
    PERFORMANCE profiles from measured data.
