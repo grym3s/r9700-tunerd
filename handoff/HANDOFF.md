@@ -233,6 +233,35 @@ server restart no longer strands the window with 403s (verified: restart at
 error: invalid or missing token" and "range: live values not yet known" was
 exactly that stranded state on a pre-fix window.
 
+## 5c. Side issue: USB Wi-Fi dongle resets (not caused by the tuner)
+
+Owner report 2026-09-04: "whenever the GPU spins up it breaks my USB Wi-Fi".
+Dongle: Realtek RTL8822BU (`rtw88_8822bu`, `wlp201s0f4u1`), SuperSpeed port
+`2-1` on xHCI `0000:c9:00.4` (the controller inside the Strix Halo display
+complex), 5 GHz channel 40. The built-in MT7925 (`wlp195s0`) is unused
+because the owner needs the dongle's range.
+
+Kernel log: plugged in 00:45, clean through ~2,000 R9700 wakes, then three
+faults 11:32–11:39: a register read timeout (-110) while the card was
+asleep, a USB reset 3 s after a wake, and "device not accepting address"
+(-71) plus a reset while the card had been active for two minutes. One of
+three lines up with a wake; the USB controller never runtime-suspended.
+Verdict: a marginal USB 3 link on that port, possibly EMI from the external
+GPU enclosure (the R9700 is on an external PCIe 3.0 x4 link with its own
+PSU), not the tuner and not the wake itself.
+
+Plan agreed with the owner: extension cables are on order; then move the
+dongle to a port on the other controller (`0000:cb:00.x`, where the T9 and
+receivers are) and away from the enclosure. Recommended in addition (owner
+runs it, needs root): keep the dongle in USB 2.0 mode and disable deep
+power save, then replug:
+
+    echo 'options rtw88_usb switch_usb_mode=0' | sudo tee /etc/modprobe.d/rtw88-usb.conf
+    echo 'options rtw88_core disable_lps_deep=1' | sudo tee -a /etc/modprobe.d/rtw88-usb.conf
+
+Check with `journalctl -kf | grep -E "8822bu|reset SuperSpeed"` across a
+few wakes and a workload. Nothing was changed on the system for this.
+
 ## 6. What was fixed in Ray's app before/after Halo's review
 
 - `load-failed` handler had the wrong arity.
