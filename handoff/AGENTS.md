@@ -9,14 +9,19 @@ Global config: `~/.hermes/config.yaml`. Secrets: `~/.hermes/.env` and
 
 | Profile | Role | Model | Where it runs | Cost |
 |---|---|---|---|---|
-| **forge** | Lead engineer: architecture, task decomposition, code review, acceptance, unblocking builders. Does not build. | `claude-opus-4-6` | Anthropic API via the owner's Claude Pro/Max OAuth (`hermes auth add anthropic --type oauth`, done 2026-09-04) | cloud, subscription |
+| **mercury** | Project manager (added 2026-09-04 16:50): owns the kanban board — triage, decomposition, sequencing, assignment, unblocking, status. Never builds or reviews code. `kanban.orchestrator_profile`. | `claude-opus-5` | Anthropic API via the owner's Claude OAuth | cloud, subscription |
+| **sonnet** | Cheap cloud builder (added 16:35): implementation, tests, refactors, scripts. Default assignee. | `claude-sonnet-5` | Anthropic OAuth | cloud, cheap |
+| **haiku** | Cheapest cloud builder (added 16:35): docs, small edits, boilerplate. | `claude-haiku-4-5-20251001` | Anthropic OAuth | cloud, cheapest |
+| **forge** | Lead engineer: architecture, code review, acceptance sign-off, unblocking builders. Does not build. | `claude-opus-4-6` | Anthropic API via the owner's Claude Pro/Max OAuth (`hermes auth add anthropic --type oauth`, done 2026-09-04) | cloud, subscription |
 | **ray** | Engineer/developer. Default assignee for all building: implementation, unit tests, bug fixes, refactors, scripts, docs. | `qwen/qwen3.8-27b@q4_k_m` (Qwen3.8-27B Q4_K_M + DFlash2 drafter) | LM Studio headless on the R9700, `http://127.0.0.1:1234/v1` | free |
 | **vale** | UI/UX designer: layout, flows, UX copy, accessibility, UI contract. Hands implementation to Ray/Halo. | `anthropic/claude-fable-5.1` | OpenRouter | cloud, expensive, **no key present** |
 | **halo** | Senior engineer, second builder: harder/larger implementation, debugging, integration, adversarial review. Runs in parallel with Ray. | `qwen3.8-27b-q6` (Qwen3.8-27B Q6_K + DFlash2 drafter) | llama.cpp b10784 Vulkan on the Strix Halo iGPU, `http://127.0.0.1:1235/v1` | free |
 
 Standing rule from the owner: **always use the cheaper agents for building.**
-Ray and Halo build; Forge leads and reviews; Vale designs. Never route
-construction to a cloud model. The profile descriptions (below) say this so
+Sonnet/Haiku (cloud, cheap) and Ray/Halo (local, free) build; Mercury manages
+the board; Forge leads and reviews; Vale designs. Opus and Fable never build.
+As of 2026-09-04 afternoon the local builders are paused (Halo being
+benchmarked/tuned; Ray unsafe until the eviction guard is installed). The profile descriptions (below) say this so
 Hermes's own routing respects it.
 
 ## Per-profile settings that differ from the global config
@@ -72,15 +77,14 @@ design … hand implementation to ray or halo".
 ```yaml
 kanban:
   review_dispatch: true
-  default_assignee: ray
-  orchestrator_profile: forge
-  max_in_progress_per_profile: 1
-  max_in_progress: 4
+  default_assignee: sonnet               # was ray; local builders are off-limits until the eviction guard is live
+  orchestrator_profile: mercury          # was forge
+  max_in_progress_per_profile: 3         # was 1 (cards ran strictly one at a time)
+  max_in_progress: 8
 auxiliary:
   kanban_decomposer:
-    provider: custom
-    base_url: http://127.0.0.1:1234/v1     # Ray's LM Studio, so decomposition is free
-    model: qwen/qwen3.8-27b@q4_k_m
+    provider: anthropic                  # was Ray's LM Studio; must not touch the R9700 while the GTT trap exists
+    model: claude-opus-5
     timeout: 600
 model:                                     # global default, only matters outside a profile
   default: anthropic/claude-opus-4.6
