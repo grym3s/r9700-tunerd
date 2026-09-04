@@ -262,6 +262,49 @@ power save, then replug:
 Check with `journalctl -kf | grep -E "8822bu|reset SuperSpeed"` across a
 few wakes and a workload. Nothing was changed on the system for this.
 
+## 5d. The 2026-09-04 afternoon "GPU instability": BIOS UMA change, not the GPUs
+
+Six boots on 2026-09-04. Journal evidence per boot:
+
+| boot | up | ended | how | system RAM | iGPU carve-out |
+|---|---|---|---|---|---|
+| -5 | 00:45 | 12:30 | clean shutdown (user reboot) | 64 GB | 64 GB |
+| -4 | 12:31 | 12:38 | clean shutdown (user reboot, BIOS change here) | 64 GB | 64 GB |
+| -3 | 12:40 | 13:33 | clean shutdown (user reboot) | **32 GB** | **96 GB** |
+| -2 | 13:34 | 13:47 | **hard reset after a freeze**: `ChatGPT` blocked >122 s in `amdgpu_driver_open_kms → rpm_resume` (R9700 D3cold resume never completed; daemon saw no "runtime active" after 13:35:51) | 32 GB | 96 GB |
+| -1 | 13:48 | 13:53 | **hard reset after an OOM storm**: page-allocation failures, OOM killer took `lm-studio` ×2, both `llama-server`s, `Hermes`, `quickshell` | 32 GB | 96 GB |
+| 0 | 13:54 | | running | 32 GB | 96 GB |
+
+No amdgpu ring timeout, GPU reset, page fault, SMU/MES failure, or ECC
+event in any boot. The undervolt (-50 mV) and cap (210 W) were applied
+normally in every boot and leave no signature. The R9700 is not the cause.
+
+Mechanism (measured, see kernel `Memory:` and `VRAM:` lines per boot): at
+12:39 the BIOS UMA frame-buffer for the Strix Halo iGPU went from 64 GB to
+96 GB, cutting system RAM from 64 GB to 32 GB. Two consequences:
+
+1. amdgpu's GTT (system memory the dGPU can use) is capped at half of RAM:
+   **15.5 GB now, ~31 GB before**. A dGPU evicts its VRAM contents into GTT
+   on every runtime suspend (D3cold) and restores them on resume; that copy
+   is why D3cold entry took 15–20 s with Ray's model resident. Ray's
+   Qwen3.8-27B Q4_K_M occupies **17.7 GB of VRAM > 15.5 GB GTT**, so a
+   suspend/resume cycle with the model loaded can no longer complete.
+   Boot -2's freeze is exactly a resume that never finished.
+2. Everything else (LM Studio, Hermes, Claude, ChatGPT, browsers, the page
+   cache for two 20 GB model files) now has 32 GB minus the above. Boot -1
+   is the OOM killer taking the GPU apps out one by one, then the desktop.
+
+Fix (owner, BIOS rule): set the UMA carve-out back to 64 GB. Halo's Q6
+model uses ~27 GB of it, so 64 GB is ample. Until that is done: do not load
+Ray's model on the R9700, or the next sleep/wake will hang the machine
+again. `lms ps` shows it is not loaded on the current boot.
+
+Hardening to add to the daemon (next task for Ray, Halo reviews): at each
+wake, if `mem_info_vram_used > mem_info_gtt_total` (both readable while
+active), log a loud warning that the card cannot safely suspend with this
+much VRAM in use, and surface it in the dashboard state pill. Do not change
+runtime-PM behaviour automatically.
+
 ## 6. What was fixed in Ray's app before/after Halo's review
 
 - `load-failed` handler had the wrong arity.
