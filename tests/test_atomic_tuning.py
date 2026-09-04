@@ -245,7 +245,7 @@ def test_status_json_active_schema(fake_tree, conf, capsys):
     assert payload["runtime_status"] == "active"
     assert payload["power_state"] == "D0"
     assert payload["control"] == "auto"
-    assert payload["tuned"] == {"offset_mv": 0, "cap_w": 210}
+    assert payload["tuned"] == {"offset_mv": 0, "cap_w": 210, "profile": None}
     assert payload["live"] is not None
     assert payload["live"]["cap_w"] == 210.0
     assert payload["ranges"]["source"] == "live"

@@ -80,9 +80,57 @@ DEFAULTS = {
     "POLL_INTERVAL_S": "2",
     "EVICT_GUARD": "1",
     "EVICT_GUARD_MARGIN": "0.90",
+    "PROFILE": "",
 }
 
 KNOWN_KEYS = frozenset(DEFAULTS.keys())
+
+# Named tuning profiles derived from the measured undervolt/power-cap
+# matrix (docs/MATRIX-2026-09-04.md, run at a fixed 210 W cap; -25/-50/-75/
+# -100 mV all PASS, the whole measured gain is at -50 mV, flat beyond).
+# Every value here traces to that document; nothing is invented. Only one
+# power cap has been characterised so far, so EFFICIENCY and PERFORMANCE
+# currently resolve to the same measured point (see each "source" string).
+PROFILE_NAMES = ("EFFICIENCY", "BALANCED", "PERFORMANCE")
+
+PROFILES: dict[str, dict] = {
+    "EFFICIENCY": {
+        "offset_mv": -50,
+        "cap_w": 210,
+        "source": (
+            "docs/MATRIX-2026-09-04.md (2026-09-04): -50 mV/210 W is the "
+            "best measured tokens/s/W (0.1888) of the four tested offsets "
+            "and captures the entire measured throughput gain (+4.8% gen "
+            "tok/s vs -25 mV) at the same power."
+        ),
+    },
+    "BALANCED": {
+        "offset_mv": -25,
+        "cap_w": 210,
+        "source": (
+            "docs/MATRIX-2026-09-04.md (2026-09-04): -25 mV/210 W is the "
+            "safe point the daemon was restored to after the "
+            "characterisation run. -50 mV is recommended for daily use but "
+            "not yet owner-adopted as the default, so BALANCED stays at "
+            "the currently adopted safe value rather than the "
+            "recommendation."
+        ),
+    },
+    "PERFORMANCE": {
+        "offset_mv": -50,
+        "cap_w": 210,
+        "source": (
+            "docs/MATRIX-2026-09-04.md (2026-09-04): -50 mV/210 W has the "
+            "highest measured sustained throughput (39.62 gen tok/s) of "
+            "the four tested offsets with zero instability (0 errors, all "
+            "gates PASS); -75/-100 mV are flat to slightly lower and buy "
+            "nothing. Only a 210 W cap has been characterised so far, so "
+            "PERFORMANCE cannot yet be distinguished from EFFICIENCY at a "
+            "higher cap; this uses the conservative measured point rather "
+            "than guessing a higher one."
+        ),
+    },
+}
 
 SETTLE_S = 0.35
 RETRY_SLEEPS = (0.25, 0.5, 1.0)  # after first try: 4 attempts total
@@ -316,6 +364,18 @@ def validate_conf(conf: dict[str, str]) -> tuple[dict, list[str]]:
     except (ValueError, TypeError):
         problems.append(f"EVICT_GUARD_MARGIN={raw!r} is not a valid number")
         parsed["EVICT_GUARD_MARGIN"] = None
+
+    # PROFILE: unset (empty) / EFFICIENCY / BALANCED / PERFORMANCE / CUSTOM
+    raw = conf.get("PROFILE", "")
+    v = raw.strip().upper()
+    if v not in ("", "CUSTOM", *PROFILE_NAMES):
+        problems.append(
+            f"PROFILE={raw!r} must be unset or one of "
+            f"CUSTOM/{'/'.join(PROFILE_NAMES)}"
+        )
+        parsed["PROFILE"] = None
+    else:
+        parsed["PROFILE"] = v or None  # normalize "" to None (unset)
 
     return parsed, problems
 
@@ -1211,6 +1271,7 @@ def build_status_payload(conf: dict) -> dict:
     tuned = {
         "offset_mv": conf.get("VOLTAGE_OFFSET_MV"),
         "cap_w": conf.get("POWER_LIMIT_W"),
+        "profile": conf.get("PROFILE"),
     }
     state_data = read_state()
     payload = {
@@ -1511,7 +1572,7 @@ def cmd_set_power_cap(conf: dict, watts: int) -> int:
     return cmd_apply(conf)
 
 
-def cmd_set_tuning(conf: dict, mv: int, watts: int) -> int:
+def cmd_set_tuning(conf: dict, mv: int, watts: int, *, profile: str = "CUSTOM") -> int:
     """Atomically set VOLTAGE_OFFSET_MV and POWER_LIMIT_W together.
 
     Both values are validated against ONE range snapshot (live ranges
@@ -1520,6 +1581,11 @@ def cmd_set_tuning(conf: dict, mv: int, watts: int) -> int:
     (set_conf_values). When active, apply is attempted once; on any
     failure the prior config is restored (also via a single atomic
     write) before returning nonzero.
+
+    `profile` is the PROFILE value stamped alongside the tuning values
+    in that same atomic write: explicit set-tuning calls (the default)
+    mark the config CUSTOM; cmd_set_profile passes the resolved profile
+    name so the whole (offset, cap, profile) triple lands in one write.
     """
     if mv > 0:
         die("VDDGFX offset must be <= 0 mV")
@@ -1565,14 +1631,17 @@ def cmd_set_tuning(conf: dict, mv: int, watts: int) -> int:
 
     prior_mv = conf["VOLTAGE_OFFSET_MV"]
     prior_watts = conf["POWER_LIMIT_W"]
+    prior_profile = conf.get("PROFILE")
 
     set_conf_values(CONF_PATH, {
         "VOLTAGE_OFFSET_MV": str(mv),
         "POWER_LIMIT_W": str(watts),
+        "PROFILE": profile,
     })
-    log(f"config VOLTAGE_OFFSET_MV={mv} POWER_LIMIT_W={watts}")
+    log(f"config VOLTAGE_OFFSET_MV={mv} POWER_LIMIT_W={watts} PROFILE={profile}")
     conf["VOLTAGE_OFFSET_MV"] = mv
     conf["POWER_LIMIT_W"] = watts
+    conf["PROFILE"] = profile
 
     rc = cmd_apply(conf)
     if rc != 0:
@@ -1585,10 +1654,57 @@ def cmd_set_tuning(conf: dict, mv: int, watts: int) -> int:
         set_conf_values(CONF_PATH, {
             "VOLTAGE_OFFSET_MV": str(prior_mv),
             "POWER_LIMIT_W": str(prior_watts),
+            "PROFILE": prior_profile or "",
         })
         conf["VOLTAGE_OFFSET_MV"] = prior_mv
         conf["POWER_LIMIT_W"] = prior_watts
+        conf["PROFILE"] = prior_profile
         return rc
+    return 0
+
+
+def resolve_profile(name: str) -> tuple[int, int]:
+    """Resolve a profile name to (offset_mv, cap_w). Dies on unknown name."""
+    key = name.strip().upper()
+    if key not in PROFILES:
+        die(f"unknown profile {name!r}; valid profiles: {'/'.join(PROFILE_NAMES)}")
+    p = PROFILES[key]
+    return p["offset_mv"], p["cap_w"]
+
+
+def cmd_set_profile(conf: dict, name: str) -> int:
+    """Resolve a named profile and apply it via the exact set-tuning path.
+
+    Resolution (unknown-name rejection) happens before any mutation.
+    Does not duplicate set-tuning's validation/atomicity: the resolved
+    (offset_mv, cap_w, profile-name) triple is handed to cmd_set_tuning,
+    which performs the single range-validated atomic write and apply.
+    """
+    mv, watts = resolve_profile(name)
+    return cmd_set_tuning(conf, mv, watts, profile=name.strip().upper())
+
+
+def cmd_list_profiles(conf: dict, *, as_json: bool = False) -> int:
+    active = conf.get("PROFILE")
+    rows = []
+    for name in PROFILE_NAMES:
+        p = PROFILES[name]
+        rows.append({
+            "name": name,
+            "offset_mv": p["offset_mv"],
+            "cap_w": p["cap_w"],
+            "source": p["source"],
+            "active": name == active,
+        })
+    if as_json:
+        print(json.dumps({"profiles": rows, "active": active}))
+        return 0
+    for r in rows:
+        marker = " *" if r["active"] else ""
+        print(
+            f"{r['name']}: offset_mv={r['offset_mv']} cap_w={r['cap_w']}{marker}"
+        )
+        print(f"  source: {r['source']}")
     return 0
 
 
@@ -1976,6 +2092,12 @@ def build_parser() -> argparse.ArgumentParser:
                       help="VDDGFX offset in mV, e.g. -25")
     stn.add_argument("--cap-w", type=int, required=True,
                       help="Power cap in watts, e.g. 250")
+    spf = sub.add_parser("set-profile")
+    spf.add_argument("name", choices=list(PROFILE_NAMES),
+                      help="Named profile to apply")
+    lp = sub.add_parser("list-profiles")
+    lp.add_argument("--json", action="store_true", dest="json_out",
+                     help="emit machine-readable JSON")
     sp = sub.add_parser("probe-poll")
     sp.add_argument("--seconds", type=int, default=30)
     dr = sub.add_parser("doctor")
@@ -2022,6 +2144,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_set_power_cap(conf, args.watts)
     if args.cmd == "set-tuning":
         return cmd_set_tuning(conf, args.offset_mv, args.cap_w)
+    if args.cmd == "set-profile":
+        return cmd_set_profile(conf, args.name)
+    if args.cmd == "list-profiles":
+        return cmd_list_profiles(conf, as_json=args.json_out)
     if args.cmd == "probe-poll":
         return cmd_probe_poll(conf, seconds=args.seconds)
     if args.cmd == "doctor":
