@@ -5,6 +5,8 @@ Owner: Richard Garnett (grymes). Machine: `Strix-AI`, Arch/Omarchy, Hyprland
 end of the 2026-09-03/04 build session. Everything below was measured on the
 live machine unless marked otherwise.
 
+**Newer: `HANDOFF-2026-09-04-PM.md` is the current state and next steps (evening). This file is the morning history.**
+
 Companion documents in this folder:
 
 | File | What |
