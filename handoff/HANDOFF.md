@@ -284,8 +284,13 @@ power save, then replug:
     echo 'options rtw88_usb switch_usb_mode=0' | sudo tee /etc/modprobe.d/rtw88-usb.conf
     echo 'options rtw88_core disable_lps_deep=1' | sudo tee -a /etc/modprobe.d/rtw88-usb.conf
 
-Check with `journalctl -kf | grep -E "8822bu|reset SuperSpeed"` across a
-few wakes and a workload. Nothing was changed on the system for this.
+**Outcome (16:35):** the owner applied both modprobe options, reloaded the
+module, moved the dongle to the other controller and replugged it. It now
+enumerates at 480 Mb/s (USB 2.0). Zero faults in the first hour (15:33 →
+16:33) against 27 fault-minutes earlier in the day, and the owner reports it
+is faster than before (no more stalled transfers, and no SuperSpeed noise
+next to the antenna). Considered fixed; the root cause was the rtw88
+driver's USB 3 mode on this chip, not the GPU.
 
 ## 5d. The 2026-09-04 afternoon "GPU instability": BIOS UMA change, not the GPUs
 
