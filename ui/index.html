@@ -22,7 +22,9 @@ header{display:flex;align-items:center;justify-content:space-between;gap:16px;pa
 .pill{display:inline-flex;align-items:center;gap:8px;padding:8px 14px;border-radius:999px;border:1px solid var(--line);background:var(--panel2);font-weight:600;font-family:var(--mono);font-size:13px}
 .pill .dot{width:10px;height:10px;border-radius:50%;background:var(--muted);box-shadow:0 0 0 0 transparent}
 .pill.sleep .dot{background:var(--sleep);box-shadow:0 0 12px var(--sleep)}
-.pill.active .dot{background:var(--accent);box-shadow:0 0 12px var(--accent)}
+.pill.warn{background:#3a2a05;color:#ffcc55;border-color:#7a5a10}
+    .pill.warn .dot{background:#ffcc55;box-shadow:0 0 12px #ffcc55}
+    .pill.active .dot{background:var(--accent);box-shadow:0 0 12px var(--accent)}
 .pill.err .dot{background:var(--bad)}
 .grid{display:grid;grid-template-columns:repeat(12,1fr);gap:16px;margin-top:16px}
 .card{grid-column:span 4;background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:16px;min-height:120px}
@@ -229,7 +231,11 @@ pre.log{margin:0;font-family:var(--mono);font-size:12px;color:#b9c4cf;background
     $('pci').textContent = s.pci || '—';
     $('clock').textContent = new Date().toLocaleTimeString();
     const active = s.runtime_status === 'active';
-    setPill($('state'), active ? 'active' : 'sleep', active ? 'ACTIVE' + (s.live && s.tuned && s.live.offset_mv===s.tuned.offset_mv ? ' · tuned' : ' · restoring…') + ((s.sampling||{}).mode==='idle-backoff' ? ' · idle' : '') : (s.power_state || 'suspended').toUpperCase() + ' · sleeping');
+    if (s.hold) {
+      setPill($('state'), 'warn', `ACTIVE · held awake · VRAM ${s.hold.vram_used_gb ?? '?'} GB > stageable ${s.hold.gtt_total_gb ?? '?'} GB`);
+    } else {
+      setPill($('state'), active ? 'active' : 'sleep', active ? 'ACTIVE' + (s.live && s.tuned && s.live.offset_mv===s.tuned.offset_mv ? ' · tuned' : ' · restoring…') + ((s.sampling||{}).mode==='idle-backoff' ? ' · idle' : '') : (s.power_state || 'suspended').toUpperCase() + ' · sleeping');
+    }
     const svc = s.service || {}; setPill($('svc'), svc.active ? 'active' : 'err', svc.active ? `watcher pid ${svc.pid||''}` : 'watcher DOWN');
     $('rts').textContent = s.runtime_status; $('pst').textContent = s.power_state; $('ctl').textContent = s.control;
     $('susp').textContent = s.suspended_ms != null ? (s.suspended_ms/1000).toFixed(0)+' s total' : '—';
