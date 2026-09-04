@@ -97,6 +97,30 @@ the fatal scan; real fatals (ring timeout, GPU reset, AER) are surfaced as warni
 sysfs writes require root; the units run as root. Reads (`discover`, `status`,
 `probe-poll`) work unprivileged. No `sudo` inside the program.
 
+## Eviction guard
+
+The ASUS Radeon AI PRO R9700 evicts VRAM contents to the Graphics Translation Table
+(GTT, backed by system RAM) when entering D3cold for power saving. On this system,
+GTT is capped at half of system RAM (15.5 GB with a 32 GB BIOS iGPU carve-out). When
+a GPU application such as an LLM inference server loads more VRAM data than fits in
+GTT (e.g. a 17.7 GB model), the eviction overflows and the system resume hangs
+indefinitely in `rpm_resume`, requiring a hard reset to recover.
+
+The eviction guard (EVICT_GUARD=1, default on) monitors VRAM usage via /proc fdinfo
+and prevents runtime PM from suspending the GPU when VRAM would overflow GTT. The
+daemon reads drm-total-vram fields from every process's open DRM fd, deduplicates
+by drm-client-id, and sums the VRAM in use. When VRAM usage exceeds EVICT_GUARD_MARGIN
+(default 0.90 = 90%) of GTT total, the daemon writes "on" to the GPU's power/control
+sysfs file, holding the device awake and preventing D3cold entry. When VRAM drops below
+80% of the margin threshold (hysteresis to avoid flapping), the hold is released.
+
+State transitions are ACTIVE_CONFIGURED (normal, no hold) -> ACTIVE_HELD (guard holding)
+-> ACTIVE_CONFIGURED (released). The state file records vram_used and gtt_total when held.
+
+On daemon startup, if the daemon finds power/control="on" with state=ACTIVE_HELD, it
+adopts the hold. Otherwise, it leaves power/control untouched. On SIGTERM or loop exit,
+any hold is released.
+
 ## Out of scope for now
 
 Fan control (firmware auto mode is required for 0 RPM; manual curves floor at 30 %),
