@@ -8,6 +8,7 @@ Never opens /dev/dri, never writes sysfs, never wakes the card.
 import argparse
 import errno
 import json
+import math
 import os
 import re
 import secrets
@@ -172,9 +173,14 @@ class GpuSysfs:
         """Read a hwmon attribute only if device is active."""
         if self.runtime_status() != "active":
             return None
-        if not self.hwmon:
+        # Recover a cached hwmon that vanished (e.g. driver rebind): re-resolve
+        # once.  A previously-cached Path is truthy even when its directory is
+        # gone, so gate on the directory still existing, not on truthiness.
+        # _ensure_hwmon() is a no-op while the cached path is still a directory,
+        # so this is PM-safe (stat checks only, no sensor reads, never /dev/dri).
+        if self.hwmon is None or not self.hwmon.is_dir():
             self._ensure_hwmon()
-        if not self.hwmon:
+        if self.hwmon is None:
             return None
         return self._read(self.hwmon / name)
 
@@ -343,10 +349,15 @@ def _build_status(include_journal=True):
     ps = GPU.power_state() if GPU else None
     susp = GPU.runtime_suspended_time() if GPU else None
     suspended_ms = int(susp) if susp is not None else None
-    try:
-        control = (Path(pci) / "power" / "control").read_text().strip()
-    except OSError:
-        control = None
+    # PM-safe read (safe in any power state — never wakes the card).  Guard on
+    # pci: with no target GPU, pci is None and Path(None) would raise TypeError
+    # (not OSError), which the except below does not catch.
+    control = None
+    if pci is not None:
+        try:
+            control = (Path(pci) / "power" / "control").read_text().strip()
+        except OSError:
+            control = None
 
     # Adaptive sensor sampling.
     mode, next_read_s, should_read, cached_block, age_s = _SAMPLING.tick(now, rs)
@@ -453,13 +464,18 @@ def _valid_bench_label(label):
 
 
 def _error_count(value):
-    """Coerce legacy `errors` payloads to an integer count: int passes
-    through (bool excluded), a list counts entries, null/None and malformed
-    values become 0."""
+    """Coerce legacy ``errors`` payloads to a nonnegative integer count.
+
+    Historical result files used lists, integers, and occasionally null or
+    malformed values.  Keep the API schema stable for all of them while not
+    allowing booleans, NaN, or negative values to masquerade as a count.
+    """
     if isinstance(value, bool) or value is None:
         return 0
     if isinstance(value, int):
-        return value
+        return max(0, value)
+    if isinstance(value, float) and math.isfinite(value) and value >= 0:
+        return int(value)
     if isinstance(value, (list, tuple)):
         return len(value)
     return 0

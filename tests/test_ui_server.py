@@ -748,9 +748,22 @@ class TestApiBenchRun:
         ui_mod.BENCH_PROC.clear()
 
     def test_bench_already_running_409(self, server, fake_subprocess):
+        # Seed a RUNNING bench (poll() is None) so the "already running"
+        # guard is actually exercised; a second /api/bench/run must get 409
+        # and start nothing new.
+        class _RunningProc:
+            def poll(self):
+                return None  # still running
+        ui_mod.BENCH_PROC.clear()
+        ui_mod.BENCH_PROC.update({
+            "proc": _RunningProc(), "label": "already", "started": time.time(),
+            "lines": deque(),
+        })
         code, body = _post(server, "/api/bench/run", {"label": "ok"})
         assert code == 409
+        assert "error" in body
         assert len(fake_subprocess) == 0
+        ui_mod.BENCH_PROC.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -774,6 +787,18 @@ class TestBenchStability:
             "label": "num", "timestamp": "2025-06-02T00:00:00Z",
             "aggregates": {"offset_stable": True, "cap_stable": True},
             "errors": 3, "d3cold_s": 10.0,
+        })
+        # Legacy numeric counts may have been serialized as JSON floats.
+        self._write(bench_dir, "floatnum.json", {
+            "label": "float", "timestamp": "2025-06-02T12:00:00Z",
+            "aggregates": {"offset_stable": True, "cap_stable": True},
+            "errors": 2.0, "d3cold_s": 10.0,
+        })
+        # A negative count is malformed and must not be exposed as a count.
+        self._write(bench_dir, "negative.json", {
+            "label": "negative", "timestamp": "2025-06-02T13:00:00Z",
+            "aggregates": {"offset_stable": True, "cap_stable": True},
+            "errors": -1, "d3cold_s": 10.0,
         })
         # errors null → 0
         self._write(bench_dir, "nullerr.json", {
@@ -819,6 +844,8 @@ class TestBenchStability:
         by_label = {b["label"]: b for b in ui_mod._list_bench()}
         assert by_label["lst"]["errors"] == 2 and by_label["lst"]["stable"] is False
         assert by_label["num"]["errors"] == 3 and by_label["num"]["stable"] is False
+        assert by_label["float"]["errors"] == 2 and by_label["float"]["stable"] is False
+        assert by_label["negative"]["errors"] == 0 and by_label["negative"]["stable"] is True
         assert by_label["nul"]["errors"] == 0 and by_label["nul"]["stable"] is True
         assert by_label["mal"]["errors"] == 0 and by_label["mal"]["stable"] is True
         assert by_label["good"]["errors"] == 0 and by_label["good"]["stable"] is True
