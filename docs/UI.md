@@ -71,6 +71,10 @@ On start the app checks whether `127.0.0.1:7970` already accepts TCP:
   for the lifetime of the window. On close the child receives SIGTERM,
   then SIGKILL after 3 s. `atexit`, SIGINT, and SIGTERM handlers all
   trigger the same cleanup path so the child is never leaked.
+- When attached, the app re-reads the unit's journal every 10 s and reloads
+  automatically if the token rotated (unit restarted) or shows an in-window
+  message if the server is gone. A restart of `r9700-ui.service` therefore
+  never strands an open window.
 - **`--no-spawn`** → the app only attaches; if the port is closed it shows
   an in-window error page with a Retry button.
 

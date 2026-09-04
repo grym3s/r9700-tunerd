@@ -193,6 +193,12 @@ class R9700App:
             GLib.unix_signal_add(GLib.PRIORITY_HIGH, sig, self._on_signal)
 
         self.win.show_all()
+        # Attached to the user unit (not our own child): the unit's token
+        # rotates on every restart, which would strand this window with 403s.
+        # Poll the journal and reload when the token changes or the server
+        # goes away.
+        if self._child is None:
+            GLib.timeout_add_seconds(10, self._refresh_attached_token)
         # Prove the GPU-safety claim at runtime: after GTK/WebKit are up,
         # none of our file descriptors may point at the R9700's DRM nodes.
         GLib.timeout_add(1500, self._check_no_r9700_drm)
@@ -236,6 +242,21 @@ class R9700App:
                 "of D3cold. Check WEBKIT_DISABLE_* and the acceleration policy."),
                 None)
         return GLib.SOURCE_REMOVE
+
+    def _refresh_attached_token(self) -> bool:
+        """Follow token rotation / restarts of r9700-ui.service (every 10 s)."""
+        if not _port_open(self.port):
+            if self._token is not None:
+                self._token = None
+                self.web.load_html(_err_html(
+                    "The dashboard server is not running.<br>"
+                    "<code>systemctl --user status r9700-ui.service</code>"), None)
+            return GLib.SOURCE_CONTINUE
+        tok = _token_from_journal()
+        if tok and tok != self._token:
+            self._token = tok
+            self.web.load_uri(f"http://{ALLOWED_HOST}:{self.port}/?t={tok}")
+        return GLib.SOURCE_CONTINUE
 
     # ── window-size persistence ────────────────────────────────────────
 
