@@ -12,6 +12,7 @@ StartLimitBurst=5
 [Service]
 Type=simple
 ExecStart=/usr/local/sbin/r9700-tunerd watch
+ExecStopPost=/usr/local/sbin/r9700-tunerd release-hold
 Restart=on-failure
 RestartSec=5
 Nice=10

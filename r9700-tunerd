@@ -694,6 +694,24 @@ def write_state(payload: str = "", *, state: str | None = None, pci=None,
         pass
 
 
+def read_state() -> dict[str, str]:
+    """Best-effort read+parse of the state file into a key=value dict.
+
+    Returns {} if the state file is missing/unreadable/empty. Never raises.
+    """
+    try:
+        text = (STATE_DIR / "state").read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    data: dict[str, str] = {}
+    for line in text.splitlines():
+        if "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        data[k.strip()] = v.strip()
+    return data
+
+
 def save_ranges(cap: dict, od: dict) -> None:
     """Best-effort: persist live cap/OD ranges for offline validation. Never raises."""
     try:
@@ -883,6 +901,32 @@ def cmd_status(conf: dict) -> int:
     print(f"pci={pci.name}")
     print(f"runtime_status={st}")
     print(f"power_state={power_state(pci)}")
+    if not conf.get("EVICT_GUARD"):
+        print("evict_guard=off")
+    else:
+        state_data = read_state()
+        vram = _evict.last_vram
+        gtt = _evict.last_gtt
+        if not gtt:
+            try:
+                gtt = int(state_data.get("gtt_total", 0))
+            except ValueError:
+                gtt = 0
+        if not gtt:
+            gtt = 0
+            try:
+                for line in MEMINFO_PATH.read_text(encoding="utf-8").splitlines():
+                    if line.startswith("MemTotal:"):
+                        gtt = (int(line.split()[1]) * 1024) // 2
+                        break
+            except (OSError, ValueError, IndexError):
+                gtt = 0
+        margin = conf.get("EVICT_GUARD_MARGIN", 0.90)
+        label = "holding" if _evict.holding else "idle"
+        print(
+            f"evict_guard={label} vram_used={vram/1e9:.1f}G "
+            f"gtt_total={gtt/1e9:.1f}G margin={margin:.2f}"
+        )
     if st != "active":
         print("sensors=skipped (not active; refusing to wake)")
         cached = load_ranges()
@@ -1154,6 +1198,27 @@ def cmd_watch(conf: dict) -> int:
     else:
         log("R9700 not found yet; waiting", syslog.LOG_WARNING)
 
+    # --- Eviction guard: startup adoption -------------------------------
+    # If a previous daemon instance was holding power/control=on when it
+    # died/restarted, adopt that hold rather than leaving it orphaned (the
+    # normal loop then releases it once VRAM allows). Never write "auto"
+    # to a hold we did not set ourselves.
+    if pci is not None and conf.get("EVICT_GUARD"):
+        try:
+            current_control = read_text(pci / "power" / "control")
+        except OSError:
+            current_control = None
+        state_data = read_state()
+        if current_control == "on" and state_data.get("state") == "ACTIVE_HELD":
+            _evict.holding = True
+            _evict.logged_hold = True  # don't re-log adoption as a fresh hold
+            log("evict-guard: adopted existing hold (control=on, state=ACTIVE_HELD)")
+        elif current_control == "on":
+            log(
+                "power/control is 'on' but state is not ACTIVE_HELD; not touching it",
+                syslog.LOG_WARNING,
+            )
+
     state = ST_SUSPENDED
     cap_checked = False
     last_good = conf  # last successfully validated config
@@ -1350,6 +1415,42 @@ def cmd_watch(conf: dict) -> int:
         time.sleep(interval)
 
     log("watcher stopping")
+    # --- Eviction guard: release any held hold on shutdown -------------
+    if _evict.holding:
+        if pci is not None:
+            write_sysfs(pci / "power" / "control", "auto")
+        _evict.holding = False
+        log("evict-guard: released hold on shutdown")
+        vo = last_good.get("VOLTAGE_OFFSET_MV")
+        write_state(state="ACTIVE_CONFIGURED", pci=pci, vo=vo)
+    return 0
+
+
+def cmd_release_hold(conf: dict) -> int:
+    """Release an eviction-guard hold left by a crashed/killed daemon.
+
+    Meant to be wired as ExecStopPost so a stale power/control=on hold
+    cannot survive a daemon crash. Only ever writes "auto", and only when
+    the state file agrees a hold was ours (state==ACTIVE_HELD).
+    """
+    pci = discover(conf, required=False)
+    if pci is None:
+        log("release-hold: R9700 not present, nothing to do")
+        return 0
+    try:
+        current = read_text(pci / "power" / "control")
+    except OSError:
+        current = None
+    state_data = read_state()
+    if current == "on" and state_data.get("state") == "ACTIVE_HELD":
+        write_sysfs(pci / "power" / "control", "auto")
+        write_state(state="ACTIVE_CONFIGURED", pci=pci)
+        log("evict-guard: released stale hold")
+    else:
+        log(
+            "evict-guard: no hold to release "
+            f"(control={current}, state={state_data.get('state', 'unknown')})"
+        )
     return 0
 
 
@@ -1384,6 +1485,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("apply")
     sub.add_parser("watch")
     sub.add_parser("reset")
+    sub.add_parser("release-hold")
     su = sub.add_parser("set-undervolt")
     su.add_argument("mv", type=int, help="VDDGFX offset in mV, e.g. -25")
     spc = sub.add_parser("set-power-cap")
@@ -1419,6 +1521,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_watch(conf)
     if args.cmd == "reset":
         return cmd_reset(conf)
+    if args.cmd == "release-hold":
+        return cmd_release_hold(conf)
     if args.cmd == "set-undervolt":
         return cmd_set_undervolt(conf, args.mv)
     if args.cmd == "set-power-cap":
