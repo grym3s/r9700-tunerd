@@ -118,6 +118,8 @@ def conf():
         "POWER_LIMIT_W": "210",
         "VOLTAGE_OFFSET_MV": "0",
         "POLL_INTERVAL_S": "2",
+        "EVICT_GUARD": "0",
+        "EVICT_GUARD_MARGIN": "0.90",
     }
     parsed, problems = rt.validate_conf(raw)
     assert not problems, f"Unexpected validation problems: {problems}"
