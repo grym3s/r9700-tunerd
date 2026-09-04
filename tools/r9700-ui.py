@@ -8,6 +8,7 @@ Never opens /dev/dri, never writes sysfs, never wakes the card.
 import argparse
 import errno
 import json
+import math
 import os
 import re
 import secrets
@@ -30,6 +31,7 @@ UI_HTML = Path(__file__).resolve().parent.parent / "ui" / "index.html"
 DAEMON_CLI = "/usr/local/sbin/r9700-tunerd"
 BENCH_ENDPOINT = "http://127.0.0.1:1234/v1"
 BENCH_MODEL = "qwen/qwen3.8-27b@q4_k_m"
+PCI_DEVICES_ROOT = Path("/sys/bus/pci/devices")
 
 MAX_BODY_BYTES = 65536
 
@@ -38,6 +40,11 @@ GPU = None
 CONFIG = {}
 BENCH_LOCK = threading.Lock()
 BENCH_PROC = {}
+# Serialization lock for mutating API operations (set / apply / reset /
+# bench/run): a second concurrent mutation gets 409 instead of racing the
+# daemon.  Deliberately separate from BENCH_LOCK, which keeps benchmark
+# ownership under its own lock for the lifetime of the bench process.
+MUT_LOCK = threading.Lock()
 
 
 # ─── PCI discovery (identity only, never bus addr / card#) ──────────────────
@@ -56,19 +63,33 @@ def _load_config():
 
 
 def _discover_pci(cfg):
+    """Collect ALL exact identity matches; refuse ambiguity.
+
+    Identity is vendor/device/subsystem only — never card number or bus
+    address.  With zero matches returns None; with two or more the device
+    is ambiguous and we select none (no silent first-match pick, no
+    hardware read attempted).
+    """
     vendor = cfg.get("VENDOR", "0x1002").lstrip("0x")
     device = cfg.get("DEVICE", "0x7551").lstrip("0x")
     subv = cfg.get("SUBSYSTEM_VENDOR", "0x1043").lstrip("0x")
     subd = cfg.get("SUBSYSTEM_DEVICE", "0x0626").lstrip("0x")
-    for dev in sorted(Path("/sys/bus/pci/devices").iterdir()):
+    try:
+        devices = sorted(PCI_DEVICES_ROOT.iterdir())
+    except (OSError, FileNotFoundError):
+        return None
+    matches = []
+    for dev in devices:
         try:
             if (dev.joinpath("vendor").read_text().strip().lstrip("0x") == vendor
                     and dev.joinpath("device").read_text().strip().lstrip("0x") == device
                     and dev.joinpath("subsystem_vendor").read_text().strip().lstrip("0x") == subv
                     and dev.joinpath("subsystem_device").read_text().strip().lstrip("0x") == subd):
-                return dev
+                matches.append(dev)
         except (OSError, FileNotFoundError):
             continue
+    if len(matches) == 1:
+        return matches[0]
     return None
 
 
@@ -84,14 +105,42 @@ class GpuSysfs:
         self.pci = pci
         self.hwmon = self._find_hwmon()
 
+    @staticmethod
+    def _hwmon_sort_key(name):
+        """Numeric hwmonN ordering (hwmon2 < hwmon10 < hwmon12); malformed
+        names sort after all numeric ones."""
+        m = re.fullmatch(r"hwmon(\d+)", name)
+        if not m:
+            return (1, 0, name)
+        return (0, int(m.group(1)), name)
+
     def _find_hwmon(self):
+        """Pick the R9700 hwmon: numeric ordering, prefer a candidate that
+        contains power1_cap, ignore malformed (non hwmonN) names."""
         hroot = self.pci / "hwmon"
-        if not hroot.is_dir():
+        try:
+            if not hroot.is_dir():
+                return None
+            children = sorted(hroot.iterdir(), key=lambda c: self._hwmon_sort_key(c.name))
+        except OSError:
             return None
-        for child in sorted(hroot.iterdir()):
-            if child.name.startswith("hwmon"):
+        best = None
+        for child in children:
+            if not re.fullmatch(r"hwmon\d+", child.name):
+                continue
+            if child.is_dir() and (child / "power1_cap").is_file():
                 return child
-        return None
+            if best is None:
+                best = child
+        return best
+
+    def _ensure_hwmon(self):
+        """Re-resolve once if a previously-cached hwmon path has disappeared
+        (e.g. driver rebind).  Only directory stat checks — safe while
+        suspended, no sensor reads, never opens /dev/dri."""
+        if self.hwmon is not None and self.hwmon.is_dir():
+            return  # cached path still valid
+        self.hwmon = self._find_hwmon()
 
     @staticmethod
     def _read(path):
@@ -122,7 +171,16 @@ class GpuSysfs:
 
     def read_hwmon(self, name):
         """Read a hwmon attribute only if device is active."""
-        if not self.hwmon or self.runtime_status() != "active":
+        if self.runtime_status() != "active":
+            return None
+        # Recover a cached hwmon that vanished (e.g. driver rebind): re-resolve
+        # once.  A previously-cached Path is truthy even when its directory is
+        # gone, so gate on the directory still existing, not on truthiness.
+        # _ensure_hwmon() is a no-op while the cached path is still a directory,
+        # so this is PM-safe (stat checks only, no sensor reads, never /dev/dri).
+        if self.hwmon is None or not self.hwmon.is_dir():
+            self._ensure_hwmon()
+        if self.hwmon is None:
             return None
         return self._read(self.hwmon / name)
 
@@ -278,6 +336,12 @@ def _read_sensors():
 def _build_status(include_journal=True):
     ts = datetime.now(timezone.utc).isoformat()
     now = time.monotonic()
+    # Refresh config on every status build so a successful Apply (which
+    # rewrites the tuning values in /etc/r9700-tunerd.conf) is visible
+    # without restarting the UI server.  Config file read only — never
+    # touches sensors.
+    global CONFIG
+    CONFIG = _load_config()
     pci = str(GPU.pci) if GPU else None
 
     # PM-safe reads (safe in any power state — never wake the card).
@@ -285,10 +349,15 @@ def _build_status(include_journal=True):
     ps = GPU.power_state() if GPU else None
     susp = GPU.runtime_suspended_time() if GPU else None
     suspended_ms = int(susp) if susp is not None else None
-    try:
-        control = (Path(pci) / "power" / "control").read_text().strip()
-    except OSError:
-        control = None
+    # PM-safe read (safe in any power state — never wakes the card).  Guard on
+    # pci: with no target GPU, pci is None and Path(None) would raise TypeError
+    # (not OSError), which the except below does not catch.
+    control = None
+    if pci is not None:
+        try:
+            control = (Path(pci) / "power" / "control").read_text().strip()
+        except OSError:
+            control = None
 
     # Adaptive sensor sampling.
     mode, next_read_s, should_read, cached_block, age_s = _SAMPLING.tick(now, rs)
@@ -399,6 +468,48 @@ def _bench_reader(proc, lines):
     proc.wait()
 
 
+_BENCH_LABEL_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+
+
+def _valid_bench_label(label):
+    """1..64 chars, filename-safe (A-Z a-z 0-9 . _ -), no path separators or
+    control characters."""
+    return (isinstance(label, str)
+            and _BENCH_LABEL_RE.fullmatch(label) is not None)
+
+
+def _error_count(value):
+    """Coerce legacy ``errors`` payloads to a nonnegative integer count.
+
+    Historical result files used lists, integers, and occasionally null or
+    malformed values.  Keep the API schema stable for all of them while not
+    allowing booleans, NaN, or negative values to masquerade as a count.
+    """
+    if isinstance(value, bool) or value is None:
+        return 0
+    if isinstance(value, int):
+        return max(0, value)
+    if isinstance(value, float) and math.isfinite(value) and value >= 0:
+        return int(value)
+    if isinstance(value, (list, tuple)):
+        return len(value)
+    return 0
+
+
+def _bench_stable(r, agg, errors):
+    """Stable only with explicit evidence: BOTH stability fields explicitly
+    true, zero errors, and a D3cold recovery present and nonnegative.
+    Missing fields are never treated as success."""
+    if agg.get("offset_stable") is not True or agg.get("cap_stable") is not True:
+        return False
+    if errors != 0:
+        return False
+    d3 = r.get("d3cold_s")
+    if isinstance(d3, bool) or not isinstance(d3, (int, float)) or d3 < 0:
+        return False
+    return True
+
+
 def _list_bench():
     results = []
     if not BENCH_DIR.is_dir():
@@ -410,8 +521,13 @@ def _list_bench():
             r = json.loads(f.read_text())
         except (json.JSONDecodeError, OSError):
             continue
-        agg = r.get("aggregates", {})
-        pre = r.get("pre_run", {})
+        agg = r.get("aggregates")
+        if not isinstance(agg, dict):
+            agg = {}
+        pre = r.get("pre_run")
+        if not isinstance(pre, dict):
+            pre = {}
+        errors = _error_count(r.get("errors"))
         results.append({
             "label": r.get("label"), "timestamp": r.get("timestamp"),
             "offset_mv": pre.get("vddgfx_offset_mv"),
@@ -421,9 +537,9 @@ def _list_bench():
             "mean_power_w": agg.get("mean_power_w"),
             "tok_s_per_w": agg.get("tok_s_per_w"),
             "max_junction_c": agg.get("max_junction_c"),
-            "errors": r.get("errors", []),
+            "errors": errors,
             "d3cold_s": r.get("d3cold_s"),
-            "stable": agg.get("offset_stable", True) and agg.get("cap_stable", True),
+            "stable": _bench_stable(r, agg, errors),
             "warmup_s": r.get("warmup_s"),
         })
     results.sort(key=lambda x: x.get("timestamp") or "", reverse=True)
@@ -502,18 +618,22 @@ class Handler(BaseHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path
         if path in ("/", "/index.html"):
             self._serve_ui()
-        elif path == "/api/status":
-            self._api_status()
-        elif path == "/api/events":
-            self._api_events()
-        elif path == "/api/bench":
-            self._json(200, _list_bench())
-        elif path == "/api/bench/status":
-            self._api_bench_status()
-        elif path == "/api/profiles":
-            self._api_profiles()
         elif path.startswith("/api/"):
-            self._err(404, "unknown endpoint")
+            if not self._auth_ok():
+                self._err(403, "invalid or missing token")
+                return
+            if path == "/api/status":
+                self._api_status()
+            elif path == "/api/events":
+                self._api_events()
+            elif path == "/api/bench":
+                self._json(200, _list_bench())
+            elif path == "/api/bench/status":
+                self._api_bench_status()
+            elif path == "/api/profiles":
+                self._api_profiles()
+            else:
+                self._err(404, "unknown endpoint")
         else:
             self._err(404, "not found")
 
@@ -606,16 +726,27 @@ class Handler(BaseHTTPRequestHandler):
         if not self._auth_ok():
             self._err(403, "invalid or missing token")
             return
-        if path == "/api/set":
-            self._api_set()
-        elif path == "/api/reset":
-            self._api_reset()
-        elif path == "/api/apply":
-            self._api_apply()
-        elif path == "/api/bench/run":
-            self._api_bench_run()
-        else:
+        if path not in ("/api/set", "/api/reset", "/api/apply", "/api/bench/run"):
             self._err(404, "unknown endpoint")
+            return
+        # Serialize mutations (set/apply/reset/bench run): a concurrent
+        # mutation gets a fast 409 instead of racing the daemon.  The lock
+        # is released as soon as the synchronous operation finishes; async
+        # benchmark ownership stays under BENCH_LOCK.
+        if not MUT_LOCK.acquire(blocking=False):
+            self._err(409, "another mutation is in progress")
+            return
+        try:
+            if path == "/api/set":
+                self._api_set()
+            elif path == "/api/reset":
+                self._api_reset()
+            elif path == "/api/apply":
+                self._api_apply()
+            elif path == "/api/bench/run":
+                self._api_bench_run()
+        finally:
+            MUT_LOCK.release()
 
     def _run_cli(self, *args):
         cmd = ["sudo", "-n", DAEMON_CLI] + list(args)
@@ -633,24 +764,43 @@ class Handler(BaseHTTPRequestHandler):
         body = self._check_post()
         if body is None:
             return
-        steps = []
+        # Validate the COMPLETE request (JSON object, no unknown fields,
+        # real integers, at least one of offset_mv/cap_w) BEFORE any
+        # subprocess is invoked — a bad request makes zero CLI calls.
+        if not isinstance(body, dict):
+            self._err(400, "body must be a JSON object")
+            return
+        unknown = set(body) - {"offset_mv", "cap_w"}
+        if unknown:
+            self._err(400, f"unknown field(s): {', '.join(sorted(unknown))}")
+            return
         offset = body.get("offset_mv")
         cap = body.get("cap_w")
+        if offset is None and cap is None:
+            self._err(400, "provide at least one of offset_mv or cap_w")
+            return
         if offset is not None:
             if (not isinstance(offset, int) or isinstance(offset, bool)
                     or offset > 0 or offset < -500):
                 self._err(400, "offset_mv must be int in [-500, 0]")
                 return
-            steps.append(self._run_cli("set-undervolt", str(offset)))
         if cap is not None:
             if (not isinstance(cap, int) or isinstance(cap, bool)
                     or cap < 50 or cap > 1000):
                 self._err(400, "cap_w must be int in [50, 1000]")
                 return
+        # All fields valid — only now may we touch the CLI.
+        steps = []
+        if offset is not None and cap is not None:
+            # Both values: one atomic set-tuning call (single config write,
+            # single range-validation snapshot, restore-on-failure in the
+            # daemon) instead of two separate mutations.
+            steps.append(self._run_cli(
+                "set-tuning", "--offset-mv", str(offset), "--cap-w", str(cap)))
+        elif offset is not None:
+            steps.append(self._run_cli("set-undervolt", str(offset)))
+        elif cap is not None:
             steps.append(self._run_cli("set-power-cap", str(cap)))
-        if not steps:
-            self._err(400, "provide offset_mv and/or cap_w")
-            return
         ok = all(s["rc"] == 0 for s in steps)
         self._json(200, {"ok": ok, "steps": steps})
 
@@ -670,17 +820,27 @@ class Handler(BaseHTTPRequestHandler):
             if BENCH_PROC and BENCH_PROC["proc"].poll() is None:
                 self._err(409, "bench already running")
                 return
+            if not isinstance(body, dict):
+                self._err(400, "body must be a JSON object")
+                return
+            allowed = {"label", "prompts", "max_tokens"}
+            unknown = set(body) - allowed
+            if unknown:
+                self._err(400, f"unknown field(s): {', '.join(sorted(unknown))}")
+                return
             label = body.get("label", "bench")
             prompts = body.get("prompts", 6)
             max_tokens = body.get("max_tokens", 512)
-            if not isinstance(label, str) or not label:
-                self._err(400, "label must be a non-empty string")
+            if not _valid_bench_label(label):
+                self._err(400, "label must be 1..64 chars of [A-Za-z0-9._-]")
                 return
-            if not isinstance(prompts, int) or prompts < 1 or prompts > 6:
+            if (not isinstance(prompts, int) or isinstance(prompts, bool)
+                    or prompts < 1 or prompts > 6):
                 self._err(400, "prompts must be int in [1, 6]")
                 return
-            if not isinstance(max_tokens, int) or max_tokens < 1:
-                self._err(400, "max_tokens must be positive int")
+            if (not isinstance(max_tokens, int) or isinstance(max_tokens, bool)
+                    or max_tokens < 1 or max_tokens > 4096):
+                self._err(400, "max_tokens must be int in [1, 4096]")
                 return
             cmd = [sys.executable, str(BENCH_SCRIPT), "run",
                    "--endpoint", BENCH_ENDPOINT, "--model", BENCH_MODEL,

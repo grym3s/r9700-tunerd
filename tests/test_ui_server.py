@@ -404,12 +404,29 @@ class TestApiSet:
         code, body = _post(server, "/api/set", {"offset_mv": -25, "cap_w": 210})
         assert code == 200
         assert body["ok"] is True
-        # Two CLI calls: set-undervolt then set-power-cap
-        assert len(fake_subprocess) == 2
+        # Both values given: one atomic set-tuning call (single config
+        # write, single range-validation snapshot in the daemon).
+        assert len(fake_subprocess) == 1
+        assert fake_subprocess[0]["cmd"] == [
+            "sudo", "-n", "/usr/local/sbin/r9700-tunerd",
+            "set-tuning", "--offset-mv", "-25", "--cap-w", "210",
+        ]
+
+    def test_offset_only_uses_set_undervolt(self, server, fake_subprocess):
+        code, body = _post(server, "/api/set", {"offset_mv": -25})
+        assert code == 200
+        assert body["ok"] is True
+        assert len(fake_subprocess) == 1
         assert fake_subprocess[0]["cmd"] == [
             "sudo", "-n", "/usr/local/sbin/r9700-tunerd", "set-undervolt", "-25"
         ]
-        assert fake_subprocess[1]["cmd"] == [
+
+    def test_cap_only_uses_set_power_cap(self, server, fake_subprocess):
+        code, body = _post(server, "/api/set", {"cap_w": 210})
+        assert code == 200
+        assert body["ok"] is True
+        assert len(fake_subprocess) == 1
+        assert fake_subprocess[0]["cmd"] == [
             "sudo", "-n", "/usr/local/sbin/r9700-tunerd", "set-power-cap", "210"
         ]
 
@@ -494,7 +511,7 @@ class TestApiProfiles:
                 "max_junction_c": 65.0,
                 "offset_stable": True, "cap_stable": True,
             },
-            "errors": [],
+            "errors": [], "d3cold_s": 11.0,
         }))
 
         code, body = _get(server, "/api/profiles", token="test-token-abcdef")
@@ -511,3 +528,515 @@ class TestApiProfiles:
         assert code == 200
         for p in body:
             assert p["measured"] is False
+
+
+# ---------------------------------------------------------------------------
+# GET-route auth: every /api/* GET must 403 without a valid token
+# ---------------------------------------------------------------------------
+
+class TestAuthGetRoutes:
+    @pytest.mark.parametrize("path", [
+        "/api/status",
+        "/api/events",
+        "/api/bench",
+        "/api/bench/status",
+        "/api/profiles",
+        "/api/unknown",
+    ])
+    def test_get_no_token_403(self, server, path):
+        code, body = _get(server, path, token=None)
+        assert code == 403
+        assert "error" in body
+
+    @pytest.mark.parametrize("path", [
+        "/api/status",
+        "/api/bench",
+        "/api/bench/status",
+        "/api/profiles",
+    ])
+    def test_get_wrong_token_403(self, server, path):
+        code, body = _get(server, path, token="wrong-token")
+        assert code == 403
+        assert "error" in body
+
+    def test_static_ui_requires_no_token(self, server):
+        req = urllib.request.Request(server + "/")
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                assert resp.status == 200
+                assert b"r9700" in resp.read()
+        except urllib.error.HTTPError:
+            pytest.fail("static UI must be served without a token")
+
+
+# ---------------------------------------------------------------------------
+# /api/set: full-request validation before ANY subprocess call
+# ---------------------------------------------------------------------------
+
+class TestApiSetValidation:
+    def test_mixed_valid_offset_invalid_cap_zero_cli(self, server, fake_subprocess):
+        """The spec's example: a valid offset plus an out-of-range cap must
+        make ZERO CLI calls (validate the complete request first)."""
+        code, body = _post(server, "/api/set", {"offset_mv": -50, "cap_w": 10})
+        assert code == 400
+        assert "cap_w" in body["error"]
+        assert len(fake_subprocess) == 0
+
+    def test_mixed_invalid_offset_valid_cap_zero_cli(self, server, fake_subprocess):
+        code, body = _post(server, "/api/set", {"offset_mv": 10, "cap_w": 210})
+        assert code == 400
+        assert "offset_mv" in body["error"]
+        assert len(fake_subprocess) == 0
+
+    def test_non_object_body_zero_cli(self, server, fake_subprocess):
+        url = server + "/api/set?t=test-token-abcdef"
+        data = json.dumps(["offset_mv", -25]).encode()
+        req = urllib.request.Request(url, data=data,
+                                     headers={"Content-Type": "application/json"},
+                                     method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                code = resp.status
+        except urllib.error.HTTPError as e:
+            code = e.code
+        assert code == 400
+        assert len(fake_subprocess) == 0
+
+    def test_unknown_field_zero_cli(self, server, fake_subprocess):
+        code, body = _post(server, "/api/set", {"offset_mv": -25, "bogus": 1})
+        assert code == 400
+        assert "bogus" in body["error"]
+        assert len(fake_subprocess) == 0
+
+    def test_empty_object_zero_cli(self, server, fake_subprocess):
+        code, body = _post(server, "/api/set", {})
+        assert code == 400
+        assert len(fake_subprocess) == 0
+
+    def test_null_values_zero_cli(self, server, fake_subprocess):
+        code, body = _post(server, "/api/set", {"offset_mv": None, "cap_w": None})
+        assert code == 400
+        assert len(fake_subprocess) == 0
+
+    def test_bool_cap_zero_cli(self, server, fake_subprocess):
+        code, body = _post(server, "/api/set", {"offset_mv": -25, "cap_w": True})
+        assert code == 400
+        assert "cap_w" in body["error"]
+        assert len(fake_subprocess) == 0
+
+    def test_float_offset_zero_cli(self, server, fake_subprocess):
+        code, body = _post(server, "/api/set", {"offset_mv": -25.5})
+        assert code == 400
+        assert len(fake_subprocess) == 0
+
+
+# ---------------------------------------------------------------------------
+# Mutation serialization: concurrent mutations get 409, no subprocess call
+# ---------------------------------------------------------------------------
+
+class TestMutationLock:
+    def test_concurrent_set_one_409_no_concurrent_exec(self, server, fake_subprocess, monkeypatch):
+        import threading as _threading
+        release = _threading.Event()
+        fake_run_real = ui_mod.subprocess.run  # the recording fake from the fixture
+
+        def _blocking(cmd, **kw):
+            if cmd and cmd[0] == "sudo":
+                result = fake_run_real(cmd, **kw)  # records exactly once
+                assert release.wait(timeout=10), "test release timed out"
+                return result
+            return fake_run_real(cmd, **kw)       # systemctl/journalctl etc.
+
+        monkeypatch.setattr(ui_mod.subprocess, "run", _blocking)
+        results = [None, None]
+
+        def worker(i):
+            results[i] = _post(server, "/api/set", {"offset_mv": -25})[0]
+
+        t = _threading.Thread(target=worker, args=(0,), daemon=True)
+        t.start()
+        # Worker holds MUT_LOCK and is parked inside the blocked CLI call;
+        # wait until it has actually appended its call before racing it.
+        deadline = time.monotonic() + 10
+        while not any(c["cmd"] and c["cmd"][0] == "sudo"
+                      for c in fake_subprocess) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        code, body = _post(server, "/api/set", {"offset_mv": -25})
+        assert code == 409
+        assert "error" in body
+        release.set()
+        t.join(timeout=10)
+        assert results[0] == 200
+        # Exactly one CLI call total; the 409 loser made none.
+        sudo_calls = [c for c in fake_subprocess if c["cmd"] and c["cmd"][0] == "sudo"]
+        assert len(sudo_calls) == 1
+        ui_mod.BENCH_PROC.clear()
+
+    def test_409_when_mutation_lock_held(self, server, fake_subprocess):
+        assert ui_mod.MUT_LOCK.acquire(blocking=False) is True
+        try:
+            code, body = _post(server, "/api/apply", {})
+        finally:
+            ui_mod.MUT_LOCK.release()
+        assert code == 409
+        assert "error" in body
+        assert len(fake_subprocess) == 0
+
+
+# ---------------------------------------------------------------------------
+# Config refresh: a successful Apply is visible on the next /api/status
+# ---------------------------------------------------------------------------
+
+class TestConfigRefresh:
+    def test_apply_reflects_in_next_status(self, server, fake_ui_tree, fake_subprocess):
+        code, body = _get(server, "/api/status", token="test-token-abcdef")
+        assert code == 200
+        assert body["tuned"]["cap_w"] == 210
+
+        code, body = _post(server, "/api/apply", {})
+        assert code == 200
+        assert body["ok"] is True
+
+        # Apply rewrote the config (simulated): next status must show it
+        # without any server restart.
+        (fake_ui_tree / "r9700-tunerd.conf").write_text(
+            "VENDOR=0x1002\nDEVICE=0x7551\n"
+            "SUBSYSTEM_VENDOR=0x1043\nSUBSYSTEM_DEVICE=0x0626\n"
+            "POWER_LIMIT_W=250\nVOLTAGE_OFFSET_MV=-50\n"
+        )
+        code, body = _get(server, "/api/status", token="test-token-abcdef")
+        assert code == 200
+        assert body["tuned"]["offset_mv"] == -50
+        assert body["tuned"]["cap_w"] == 250
+
+
+# ---------------------------------------------------------------------------
+# /api/bench/run: bounded, sanitized launch input
+# ---------------------------------------------------------------------------
+
+class TestApiBenchRun:
+    @pytest.mark.parametrize("label", [
+        "../evil", "a/b", "a\\b", "a b", "tab\there", "ctrl\x01",
+        "x" * 65, "",
+    ])
+    def test_unsafe_label_400(self, server, fake_subprocess, label):
+        code, body = _post(server, "/api/bench/run", {"label": label})
+        assert code == 400
+        assert "label" in body["error"]
+        assert len(fake_subprocess) == 0
+
+    def test_nonstring_label_400(self, server, fake_subprocess):
+        code, body = _post(server, "/api/bench/run", {"label": 123})
+        assert code == 400
+        assert len(fake_subprocess) == 0
+
+    @pytest.mark.parametrize("prompts", [0, 7, True, -1, 2.5])
+    def test_bad_prompts_400(self, server, fake_subprocess, prompts):
+        code, body = _post(server, "/api/bench/run", {"label": "ok", "prompts": prompts})
+        assert code == 400
+        assert "prompts" in body["error"]
+        assert len(fake_subprocess) == 0
+
+    @pytest.mark.parametrize("max_tokens", [0, 4097, True, -5, 10.5])
+    def test_bad_max_tokens_400(self, server, fake_subprocess, max_tokens):
+        code, body = _post(server, "/api/bench/run", {"label": "ok", "max_tokens": max_tokens})
+        assert code == 400
+        assert "max_tokens" in body["error"]
+        assert len(fake_subprocess) == 0
+
+    def test_unknown_field_400(self, server, fake_subprocess):
+        code, body = _post(server, "/api/bench/run", {"label": "ok", "extra": 1})
+        assert code == 400
+        assert "extra" in body["error"]
+        assert len(fake_subprocess) == 0
+
+    def test_valid_run_starts_once(self, server, fake_ui_tree, fake_subprocess):
+        code, body = _post(
+            server, "/api/bench/run",
+            {"label": "run-01.A", "prompts": 3, "max_tokens": 256})
+        assert code == 200
+        assert body["ok"] is True
+        popens = [c for c in fake_subprocess if c["kind"] == "popen"]
+        assert len(popens) == 1
+        cmd = popens[0]["cmd"]
+        assert "run" in cmd and "--label" in cmd and "run-01.A" in cmd
+        assert "--prompts" in cmd and "3" in cmd
+        assert "--max-tokens" in cmd and "256" in cmd
+        ui_mod.BENCH_PROC.clear()
+
+    def test_bench_already_running_409(self, server, fake_subprocess):
+        # Seed a RUNNING bench (poll() is None) so the "already running"
+        # guard is actually exercised; a second /api/bench/run must get 409
+        # and start nothing new.
+        class _RunningProc:
+            def poll(self):
+                return None  # still running
+        ui_mod.BENCH_PROC.clear()
+        ui_mod.BENCH_PROC.update({
+            "proc": _RunningProc(), "label": "already", "started": time.time(),
+            "lines": deque(),
+        })
+        code, body = _post(server, "/api/bench/run", {"label": "ok"})
+        assert code == 409
+        assert "error" in body
+        assert len(fake_subprocess) == 0
+        ui_mod.BENCH_PROC.clear()
+
+
+# ---------------------------------------------------------------------------
+# /api/bench listing: integer error counts, strict stability evidence
+# ---------------------------------------------------------------------------
+
+class TestBenchStability:
+    def _write(self, bench_dir, name, obj):
+        (bench_dir / name).write_text(json.dumps(obj))
+
+    def test_legacy_error_shapes_and_stability(self, fake_ui_tree):
+        bench_dir = fake_ui_tree / "bench"
+        # errors as a list → count 2 → never stable
+        self._write(bench_dir, "legacy-list.json", {
+            "label": "lst", "timestamp": "2025-06-01T00:00:00Z",
+            "aggregates": {"offset_stable": True, "cap_stable": True},
+            "errors": ["a", "b"], "d3cold_s": 10.0,
+        })
+        # errors as a number
+        self._write(bench_dir, "num.json", {
+            "label": "num", "timestamp": "2025-06-02T00:00:00Z",
+            "aggregates": {"offset_stable": True, "cap_stable": True},
+            "errors": 3, "d3cold_s": 10.0,
+        })
+        # Legacy numeric counts may have been serialized as JSON floats.
+        self._write(bench_dir, "floatnum.json", {
+            "label": "float", "timestamp": "2025-06-02T12:00:00Z",
+            "aggregates": {"offset_stable": True, "cap_stable": True},
+            "errors": 2.0, "d3cold_s": 10.0,
+        })
+        # A negative count is malformed and must not be exposed as a count.
+        self._write(bench_dir, "negative.json", {
+            "label": "negative", "timestamp": "2025-06-02T13:00:00Z",
+            "aggregates": {"offset_stable": True, "cap_stable": True},
+            "errors": -1, "d3cold_s": 10.0,
+        })
+        # errors null → 0
+        self._write(bench_dir, "nullerr.json", {
+            "label": "nul", "timestamp": "2025-06-03T00:00:00Z",
+            "aggregates": {"offset_stable": True, "cap_stable": True},
+            "errors": None, "d3cold_s": 10.0,
+        })
+        # malformed errors → 0
+        self._write(bench_dir, "malformed.json", {
+            "label": "mal", "timestamp": "2025-06-04T00:00:00Z",
+            "aggregates": {"offset_stable": True, "cap_stable": True},
+            "errors": "weird", "d3cold_s": 10.0,
+        })
+        # fully valid → stable
+        self._write(bench_dir, "good.json", {
+            "label": "good", "timestamp": "2025-06-05T00:00:00Z",
+            "aggregates": {"offset_stable": True, "cap_stable": True},
+            "errors": [], "d3cold_s": 12.5,
+        })
+        # missing d3cold → NOT stable even with clean errors
+        self._write(bench_dir, "nod3.json", {
+            "label": "nod3", "timestamp": "2025-06-06T00:00:00Z",
+            "aggregates": {"offset_stable": True, "cap_stable": True},
+            "errors": [],
+        })
+        # stability fields missing → NOT stable (no silent success)
+        self._write(bench_dir, "nostab.json", {
+            "label": "nostab", "timestamp": "2025-06-07T00:00:00Z",
+            "errors": [], "d3cold_s": 10.0,
+        })
+        # one stability field false → NOT stable
+        self._write(bench_dir, "half.json", {
+            "label": "half", "timestamp": "2025-06-08T00:00:00Z",
+            "aggregates": {"offset_stable": True, "cap_stable": False},
+            "errors": [], "d3cold_s": 10.0,
+        })
+        # negative d3cold → NOT stable
+        self._write(bench_dir, "neg.json", {
+            "label": "neg", "timestamp": "2025-06-09T00:00:00Z",
+            "aggregates": {"offset_stable": True, "cap_stable": True},
+            "errors": [], "d3cold_s": -1.0,
+        })
+        by_label = {b["label"]: b for b in ui_mod._list_bench()}
+        assert by_label["lst"]["errors"] == 2 and by_label["lst"]["stable"] is False
+        assert by_label["num"]["errors"] == 3 and by_label["num"]["stable"] is False
+        assert by_label["float"]["errors"] == 2 and by_label["float"]["stable"] is False
+        assert by_label["negative"]["errors"] == 0 and by_label["negative"]["stable"] is True
+        assert by_label["nul"]["errors"] == 0 and by_label["nul"]["stable"] is True
+        assert by_label["mal"]["errors"] == 0 and by_label["mal"]["stable"] is True
+        assert by_label["good"]["errors"] == 0 and by_label["good"]["stable"] is True
+        assert by_label["nod3"]["stable"] is False
+        assert by_label["nostab"]["stable"] is False
+        assert by_label["half"]["stable"] is False
+        assert by_label["neg"]["stable"] is False
+        for b in by_label.values():
+            assert isinstance(b["errors"], int)
+            assert not isinstance(b["errors"], bool)
+
+
+# ---------------------------------------------------------------------------
+# GpuSysfs._find_hwmon: numeric ordering, power1_cap preference, malformed
+# names, re-resolve after driver rebind
+# ---------------------------------------------------------------------------
+
+def _mk_pci(tmp_path, name, files=()):
+    d = tmp_path / "pci" / name
+    d.mkdir(parents=True)
+    (d / "power").mkdir()
+    (d / "power" / "runtime_status").write_text("active\n")
+    for f in files:
+        (d / f).write_text("1\n")
+    return d
+
+
+class TestFindHwmon:
+    def test_prefers_power1_cap_over_stale_lower(self, tmp_path):
+        pci = _mk_pci(tmp_path, "0000:aa:00.0")
+        (pci / "hwmon" / "hwmon7").mkdir(parents=True)       # stale, no power1_cap
+        (pci / "hwmon" / "hwmon12").mkdir(parents=True)
+        (pci / "hwmon" / "hwmon12" / "power1_cap").write_text("1\n")
+        gpu = ui_mod.GpuSysfs(pci)
+        assert gpu.hwmon.name == "hwmon12"
+
+    def test_numeric_ordering_beats_lexicographic(self, tmp_path):
+        pci = _mk_pci(tmp_path, "0000:aa:00.0")
+        # hwmon2 (with power1_cap) must win over hwmon10 even though
+        # lexicographically "hwmon10" < "hwmon2".
+        (pci / "hwmon" / "hwmon2").mkdir(parents=True)
+        (pci / "hwmon" / "hwmon2" / "power1_cap").write_text("1\n")
+        (pci / "hwmon" / "hwmon10").mkdir(parents=True)
+        gpu = ui_mod.GpuSysfs(pci)
+        assert gpu.hwmon.name == "hwmon2"
+
+    def test_malformed_names_ignored(self, tmp_path):
+        pci = _mk_pci(tmp_path, "0000:aa:00.0")
+        (pci / "hwmon" / "hwmonx").mkdir(parents=True)          # malformed
+        (pci / "hwmon" / "notahwmon").mkdir(parents=True)       # malformed
+        (pci / "hwmon" / "hwmon3").mkdir(parents=True)
+        (pci / "hwmon" / "hwmon3" / "power1_cap").write_text("1\n")
+        gpu = ui_mod.GpuSysfs(pci)
+        assert gpu.hwmon.name == "hwmon3"
+
+    def test_no_power1_cap_falls_back_to_lowest(self, tmp_path):
+        pci = _mk_pci(tmp_path, "0000:aa:00.0")
+        (pci / "hwmon" / "hwmon9").mkdir(parents=True)
+        (pci / "hwmon" / "hwmon4").mkdir(parents=True)
+        gpu = ui_mod.GpuSysfs(pci)
+        assert gpu.hwmon.name == "hwmon4"
+
+    def test_re_resolve_after_rebind(self, tmp_path):
+        pci = _mk_pci(tmp_path, "0000:aa:00.0")
+        old = pci / "hwmon" / "hwmon7"
+        old.mkdir(parents=True)
+        (old / "power1_cap").write_text("1\n")
+        gpu = ui_mod.GpuSysfs(pci)
+        assert gpu.hwmon.name == "hwmon7"
+        # Driver rebind: old hwmon gone, new one appears.
+        import shutil
+        shutil.rmtree(old)
+        new = pci / "hwmon" / "hwmon21"
+        new.mkdir(parents=True)
+        (new / "power1_cap").write_text("1\n")
+        assert gpu.read_hwmon("power1_cap") == "1"
+        assert gpu.hwmon.name == "hwmon21"
+
+    def test_suspended_no_hwmon_read(self, tmp_path, monkeypatch):
+        """While suspended, read_hwmon must return None and must NOT open the
+        hwmon sensor file (only PM-safe runtime_status may be read)."""
+        pci = _mk_pci(tmp_path, "0000:aa:00.0")
+        hw = pci / "hwmon" / "hwmon7"
+        hw.mkdir(parents=True)
+        (hw / "power1_cap").write_text("1\n")
+        (pci / "power" / "runtime_status").write_text("suspended\n")
+        gpu = ui_mod.GpuSysfs(pci)
+        assert gpu.hwmon.name == "hwmon7"
+
+        import shutil
+        shutil.rmtree(hw)  # hwmon vanished (rebind) while suspended
+
+        opened = []
+
+        def _spy_read(*args):
+            opened.append(str(args[-1]) if args else "")
+            return None
+
+        # _read is a staticmethod; monkeypatch to a plain fn that records.
+        monkeypatch.setattr(ui_mod.GpuSysfs, "_read", staticmethod(_spy_read),
+                            raising=False)
+        assert gpu.read_hwmon("power1_cap") is None
+        hwmon_reads = [p for p in opened if "hwmon7" in p]
+        assert hwmon_reads == [], f"hwmon sensor read while suspended: {hwmon_reads}"
+        # No re-resolve happened (hwmon path unchanged, still the deleted dir).
+        assert gpu.hwmon.name == "hwmon7"
+
+
+# ---------------------------------------------------------------------------
+# PCI discovery: exact-identity matches, refuse ambiguity
+# ---------------------------------------------------------------------------
+
+def _mk_pci_dev(root, name, subd="0x0626"):
+    d = root / name
+    d.mkdir(parents=True)
+    (d / "vendor").write_text("0x1002\n")
+    (d / "device").write_text("0x7551\n")
+    (d / "subsystem_vendor").write_text("0x1043\n")
+    (d / "subsystem_device").write_text(subd + "\n")
+    return d
+
+
+class TestPciDiscovery:
+    def test_single_exact_match_selected(self, tmp_path, monkeypatch):
+        root = tmp_path / "pci"
+        _mk_pci_dev(root, "0000:aa:00.0")
+        _mk_pci_dev(root, "0000:bb:00.0", subd="0x9999")  # different identity
+        monkeypatch.setattr(ui_mod, "PCI_DEVICES_ROOT", root)
+        cfg = {"VENDOR": "0x1002", "DEVICE": "0x7551",
+               "SUBSYSTEM_VENDOR": "0x1043", "SUBSYSTEM_DEVICE": "0x0626"}
+        assert ui_mod._discover_pci(cfg) == root / "0000:aa:00.0"
+
+    def test_ambiguous_matches_refused(self, tmp_path, monkeypatch):
+        root = tmp_path / "pci"
+        _mk_pci_dev(root, "0000:aa:00.0")
+        _mk_pci_dev(root, "0000:cc:00.0")  # exact duplicate identity
+        monkeypatch.setattr(ui_mod, "PCI_DEVICES_ROOT", root)
+        cfg = {"VENDOR": "0x1002", "DEVICE": "0x7551",
+               "SUBSYSTEM_VENDOR": "0x1043", "SUBSYSTEM_DEVICE": "0x0626"}
+        assert ui_mod._discover_pci(cfg) is None
+
+    def test_no_match_none(self, tmp_path, monkeypatch):
+        root = tmp_path / "pci"
+        _mk_pci_dev(root, "0000:bb:00.0", subd="0x9999")
+        monkeypatch.setattr(ui_mod, "PCI_DEVICES_ROOT", root)
+        cfg = {"VENDOR": "0x1002", "DEVICE": "0x7551",
+               "SUBSYSTEM_VENDOR": "0x1043", "SUBSYSTEM_DEVICE": "0x0626"}
+        assert ui_mod._discover_pci(cfg) is None
+
+    def test_ambiguous_no_gpu_no_hardware_read(self, tmp_path, monkeypatch,
+                                               fake_subprocess):
+        """Two exact matches → GPU stays None; _build_status must not touch
+        any sensor file."""
+        root = tmp_path / "pci"
+        a = _mk_pci_dev(root, "0000:aa:00.0")
+        b = _mk_pci_dev(root, "0000:cc:00.0")
+        monkeypatch.setattr(ui_mod, "PCI_DEVICES_ROOT", root)
+        cfg = {"VENDOR": "0x1002", "DEVICE": "0x7551",
+               "SUBSYSTEM_VENDOR": "0x1043", "SUBSYSTEM_DEVICE": "0x0626"}
+        assert ui_mod._discover_pci(cfg) is None
+
+        monkeypatch.setattr(ui_mod, "GPU", None)
+        opened = []
+
+        def _spy_read(self, path):
+            opened.append(str(path))
+            return None
+
+        monkeypatch.setattr(ui_mod.GpuSysfs, "_read", _spy_read, raising=False)
+        payload = ui_mod._build_status(include_journal=False)
+        assert payload["pci"] is None
+        assert payload["live"] is None
+        assert opened == []
+        # No daemon/CLI work was started for the ambiguous (absent) GPU.
+        sudo_calls = [c for c in fake_subprocess
+                      if c["cmd"] and c["cmd"][0] == "sudo"]
+        assert sudo_calls == []
