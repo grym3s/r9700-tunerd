@@ -13,8 +13,7 @@ Companion documents in this folder:
 | `tools/ask_qwen.py` | The one-shot helper used to give Ray/Halo tasks with thinking on and line-numbered attachments |
 | `tools/llama-halo.service` | Halo's llama.cpp user unit (copy of the live file) |
 | `tools/lmstudio-qwen3.8-27b-dflash2.json` | Ray's LM Studio per-model config with DFlash2 enabled (copy of the live file) |
-| `reviews/app-wrapper-task-spec.md` | The task Ray received for the native app |
-| `reviews/app-wrapper-halo-review.md` | Halo's review of Ray's app (REQUEST CHANGES, applied) |
+| `agent-work/` | Every task brief given to Ray/Halo and every reply that was acted on (task30 app spec, task31 Halo review, task40 evict-guard spec, …). This is where to look for "what did the agents do"; the work was not routed through Hermes sessions (see AGENTS.md, "How the orchestrator actually drove Ray and Halo") |
 
 Repo docs that this handoff does not duplicate:
 `docs/ARCHITECTURE.md`, `docs/AMDGPU-R9700-NOTES.md` (measured hardware facts),
@@ -219,13 +218,13 @@ What to do next if the loop is ever seen again (cheapest first):
   it was the process that opened the card into the 15.5 GB GTT trap. It
   was launched again at 13:57, 14:26 and 15:04. The 14:45–15:00 loop of 72
   wakes at 13 s happened with it running in the background.
-- **Omarchy display/brightness panel** (`plugins/panels/monitor`,
-  refreshes every 5 s via `omarchy-monitor-state` → `hyprctl monitors all`
-  + `brightnessctl -d <monitor>`) was open during both loop windows
-  (10:03–10:09 and 14:44–15:00). Direct test: `hyprctl monitors all -j`
-  does NOT wake the card. `brightnessctl` appeared to, but Mission Center
-  launched in the same second, so that result is contaminated; retest with
-  Mission Center closed before blaming the panel.
+- **Omarchy display/brightness panel** was open during both loop windows,
+  which made it a suspect. Clean retest at 15:15 with Mission Center
+  closed: `hyprctl monitors all -j`, `brightnessctl -l` and the full
+  `omarchy-monitor-state` each left the card suspended. The panel is
+  cleared. The morning loop is attributed to Mission Center as well (its
+  helper process was present in the 10:38 process scans; exact launch time
+  before 09:50 not recovered).
 - The tuner app is cleared: at 10:06 the panel was open, at 14:45 Mission
   Center was running, and the app was not involved in either.
 
