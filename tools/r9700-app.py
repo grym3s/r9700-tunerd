@@ -22,13 +22,14 @@ os.environ["WEBKIT_DISABLE_DMABUF_RENDERER"] = "1"
 import argparse
 import atexit
 import json
-import signal
 import socket
 import subprocess
-import sys
-import threading
+import html
+import urllib.parse
 from pathlib import Path
 from typing import Optional
+
+from r9700_app_backend import Backend, server_is_dashboard
 
 import gi
 gi.require_version("Gtk", "3.0")
@@ -70,58 +71,6 @@ def _token_from_journal() -> Optional[str]:
     return token
 
 
-def _spawn_ui(port: int) -> tuple[Optional[str], Optional[subprocess.Popen]]:
-    """Spawn r9700-ui.py, read its token (10 s timeout).  Returns (token, proc)."""
-    proc = subprocess.Popen(
-        [sys.executable, str(UI_SCRIPT), "--port", str(port)],
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-        text=True, cwd=str(REPO_ROOT), preexec_fn=_die_with_parent)
-    token: Optional[str] = None
-    got = threading.Event()
-
-    def _read() -> None:
-        # Keep draining for the life of the child: a full pipe would block
-        # the server's next print().  Only the first TOKEN line is used.
-        nonlocal token
-        for line in proc.stdout:
-            if token is None and line.startswith("TOKEN: "):
-                token = line[7:].strip()
-                got.set()
-
-    threading.Thread(target=_read, daemon=True).start()
-    if not got.wait(timeout=10):
-        _kill(proc)
-        return None, None
-    return token, proc
-
-
-def _die_with_parent() -> None:
-    """Child preexec: ask the kernel to SIGTERM us when the parent dies.
-
-    This makes server cleanup independent of the parent's main loop: even if
-    the app is SIGKILLed or hangs and gets killed, no server is orphaned.
-    """
-    try:
-        import ctypes
-        libc = ctypes.CDLL("libc.so.6", use_errno=True)
-        PR_SET_PDEATHSIG = 1
-        libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM, 0, 0, 0)
-    except Exception:
-        pass  # best effort; atexit cleanup still covers normal exits
-
-
-def _kill(proc: Optional[subprocess.Popen]) -> None:
-    """SIGTERM → wait 3 s → SIGKILL."""
-    if proc is None or proc.poll() is not None:
-        return
-    proc.terminate()
-    try:
-        proc.wait(timeout=3)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
-
-
 def _r9700_drm_nodes() -> set[str]:
     """/dev/dri paths belonging to the R9700 (vendor 0x1002, device 0x7551)."""
     nodes: set[str] = set()
@@ -148,7 +97,7 @@ def _err_html(msg: str) -> str:
         'a{color:#4fc3f7;font-size:1.1em;margin-top:1em;'
         'text-decoration:none;display:inline-block}'
         '</style></head><body><div><h2>R9700 Tuner</h2><p>'
-        + msg +
+        + html.escape(msg, quote=True) +
         '</p><a href="r9700app://retry">Retry</a></div></body></html>'
     )
 
@@ -164,15 +113,14 @@ class R9700App:
         self._child: Optional[subprocess.Popen] = None
         self._fullscreen = False
         self._cleaned = False
+        self._backend = Backend(port, REPO_ROOT, _token_from_journal)
+        # Register before resolution or any GTK/WebKit call: startup failures
+        # must not orphan a server child.
+        atexit.register(self._cleanup)
 
         # ── resolve token ──────────────────────────────────────────────
-        if _port_open(port):
-            self._token = _token_from_journal()
-        elif not no_spawn:
-            self._token, self._child = _spawn_ui(port)
-        # Register cleanup BEFORE any GTK/WebKit call that can raise, so a
-        # failed start never orphans a spawned UI server (Halo review #2).
-        atexit.register(self._cleanup)
+        self._token = self._backend.resolve(no_spawn)
+        self._child = self._backend.child
         # else: --no-spawn and port closed → token stays None → error page
 
         # ── window ─────────────────────────────────────────────────────
@@ -217,6 +165,8 @@ class R9700App:
         # goes away.
         if self._child is None:
             GLib.timeout_add_seconds(10, self._refresh_attached_token)
+        else:
+            GLib.timeout_add_seconds(1, self._watch_child)
         # Prove the GPU-safety claim at runtime: after GTK/WebKit are up,
         # none of our file descriptors may point at the R9700's DRM nodes.
         GLib.timeout_add(1500, self._check_no_r9700_drm)
@@ -271,10 +221,29 @@ class R9700App:
                     "<code>systemctl --user status r9700-ui.service</code>"), None)
             return GLib.SOURCE_CONTINUE
         tok = _token_from_journal()
-        if tok and tok != self._token:
+        if tok and tok != self._token and server_is_dashboard(self.port, tok):
             self._token = tok
             self.web.load_uri(f"http://{ALLOWED_HOST}:{self.port}/?t={tok}")
         return GLib.SOURCE_CONTINUE
+
+    def _watch_child(self) -> bool:
+        if self._backend.child_stopped():
+            self._backend.fail_child()
+            self._child = None
+            self._token = None
+            self.web.load_html(_err_html("The dashboard server stopped."), None)
+            return GLib.SOURCE_REMOVE
+        return GLib.SOURCE_CONTINUE
+
+    def _retry(self) -> None:
+        self._backend.fail_child()
+        self._token = self._backend.resolve(False)
+        self._child = self._backend.child
+        if self._token:
+            self.web.load_uri(f"http://{ALLOWED_HOST}:{self.port}/?t={self._token}")
+            GLib.timeout_add_seconds(1, self._watch_child)
+        else:
+            self.web.load_html(_err_html("Could not connect to the dashboard server."), None)
 
     # ── window-size persistence ────────────────────────────────────────
 
@@ -300,7 +269,7 @@ class R9700App:
             return
         self._cleaned = True
         self._save_size()
-        _kill(self._child)
+        self._backend.cleanup()
         self._child = None
 
     def quit(self) -> None:
@@ -337,23 +306,30 @@ class R9700App:
         # NAVIGATION_ACTION and NEW_WINDOW_ACTION both carry a navigation action
         uri = dec.get_navigation_action().get_request().get_uri()
         if dtype == WebKit2.PolicyDecisionType.NEW_WINDOW_ACTION:
-            if uri.startswith("http://") or uri.startswith("https://"):
+            if urllib.parse.urlparse(uri).scheme in ("http", "https"):
                 Gio.AppInfo.launch_default_for_uri(uri, None)
             dec.ignore()
             return
         # Retry pseudo-URI → reload the main page
         if uri == "r9700app://retry":
-            if self._token:
-                wv.load_uri(
-                    f"http://{ALLOWED_HOST}:{self.port}/?t={self._token}")
+            self._retry()
             dec.ignore()
             return
         # Only our own origin is allowed inside the window
-        if uri.startswith(f"http://{ALLOWED_HOST}:{self.port}/"):
+        parsed = urllib.parse.urlparse(uri)
+        try:
+            local_origin = (parsed.scheme == "http" and
+                            parsed.hostname == ALLOWED_HOST and
+                            parsed.port == self.port and
+                            parsed.path.startswith("/"))
+        except ValueError:
+            local_origin = False
+        if local_origin:
             dec.use()
             return
         # External link → open in default browser, cancel in view
-        Gio.AppInfo.launch_default_for_uri(uri, None)
+        if parsed.scheme in ("http", "https"):
+            Gio.AppInfo.launch_default_for_uri(uri, None)
         dec.ignore()
 
     # ── load failure ───────────────────────────────────────────────────
