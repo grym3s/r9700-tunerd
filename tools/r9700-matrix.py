@@ -22,6 +22,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 DAEMON = "/usr/local/sbin/r9700-tunerd"
+
+
+def daemon_cmd(*args: str) -> list[str]:
+    """Daemon CLI invocation; goes through sudo -n when not root (narrow sudoers rule)."""
+    import os
+    prefix = [] if os.geteuid() == 0 else ["sudo", "-n"]
+    return prefix + [DAEMON, *args]
 BENCH_DEFAULT = "tools/r9700-bench.py"
 MATRIX_CSV = "matrix.csv"
 CONF_PATH = Path("/etc/r9700-tunerd.conf")
@@ -176,32 +183,52 @@ def wait_d3cold(timeout: float = 60.0) -> bool:
     """Poll daemon status until D3cold is reported or timeout elapses."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        rc, out, _ = run_cmd([DAEMON, "status"], timeout=10)
+        rc, out, _ = run_cmd(daemon_cmd("status"), timeout=10)
         if rc == 0 and "D3cold" in out:
             return True
         time.sleep(1.0)
     return False
 
 
+def verify_readback(offset_mv: int, cap_w: int, timeout: float = 10.0) -> bool:
+    """Verify the daemon reports the target offset/cap (retry up to *timeout*).
+
+    Active card: compare the live sysfs readback in `status`.
+    Suspended card (D3cold): the daemon validated against cached ranges and
+    wrote the config; the watcher applies it on the next wake.  Verify the
+    config instead — the harness's offset_stable/cap_stable gates then prove
+    the live apply once the bench wakes the card.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        rc, out, _ = run_cmd(daemon_cmd("status"), timeout=10)
+        if rc == 0:
+            info = parse_status(out)
+            if info.get("suspended"):
+                cfg = read_config()
+                if cfg.get("offset_mv") == offset_mv and cfg.get("cap_w") == cap_w:
+                    print("  verify: card suspended; config holds target, "
+                          "watcher applies on wake", file=sys.stderr)
+                    return True
+            elif info.get("offset_mv") == offset_mv and info.get("cap_w") == cap_w:
+                return True
+        time.sleep(1.0)
+    return False
+
+
 def apply_and_verify(offset_mv: int, cap_w: int) -> bool:
     """Apply offset + cap via daemon CLI, then verify readback (retry ≤ 10 s)."""
-    rc, _, err = run_cmd([DAEMON, "set-undervolt", str(offset_mv)], timeout=15)
+    rc, _, err = run_cmd(daemon_cmd("set-undervolt", str(offset_mv)), timeout=15)
     if rc != 0:
         print(f"  FAIL: set-undervolt {offset_mv} → rc={rc} {err.strip()}", file=sys.stderr)
         return False
-    rc, _, err = run_cmd([DAEMON, "set-power-cap", str(cap_w)], timeout=15)
+    rc, _, err = run_cmd(daemon_cmd("set-power-cap", str(cap_w)), timeout=15)
     if rc != 0:
         print(f"  FAIL: set-power-cap {cap_w} → rc={rc} {err.strip()}", file=sys.stderr)
         return False
     # Verify readback matches target (retry up to 10 s)
-    deadline = time.monotonic() + 10.0
-    while time.monotonic() < deadline:
-        rc, out, _ = run_cmd([DAEMON, "status"], timeout=10)
-        if rc == 0:
-            info = parse_status(out)
-            if info.get("offset_mv") == offset_mv and info.get("cap_w") == cap_w:
-                return True
-        time.sleep(1.0)
+    if verify_readback(offset_mv, cap_w):
+        return True
     print(f"  FAIL: verify timeout — readback ≠ target ({offset_mv} mV / {cap_w} W)",
           file=sys.stderr)
     return False
@@ -210,23 +237,17 @@ def apply_and_verify(offset_mv: int, cap_w: int) -> bool:
 def restore_safe_point(offset_mv: int, cap_w: int) -> bool:
     """Restore the previous safe point and verify the readback."""
     print(f"  RESTORE: set-undervolt {offset_mv} mV, set-power-cap {cap_w} W", file=sys.stderr)
-    rc, _, err = run_cmd([DAEMON, "set-undervolt", str(offset_mv)], timeout=15)
+    rc, _, err = run_cmd(daemon_cmd("set-undervolt", str(offset_mv)), timeout=15)
     if rc != 0:
         print(f"  RESTORE FAIL: set-undervolt rc={rc} {err.strip()}", file=sys.stderr)
         return False
-    rc, _, err = run_cmd([DAEMON, "set-power-cap", str(cap_w)], timeout=15)
+    rc, _, err = run_cmd(daemon_cmd("set-power-cap", str(cap_w)), timeout=15)
     if rc != 0:
         print(f"  RESTORE FAIL: set-power-cap rc={rc} {err.strip()}", file=sys.stderr)
         return False
-    deadline = time.monotonic() + 10.0
-    while time.monotonic() < deadline:
-        rc, out, _ = run_cmd([DAEMON, "status"], timeout=10)
-        if rc == 0:
-            info = parse_status(out)
-            if info.get("offset_mv") == offset_mv and info.get("cap_w") == cap_w:
-                print("  RESTORE: verified OK", file=sys.stderr)
-                return True
-        time.sleep(1.0)
+    if verify_readback(offset_mv, cap_w):
+        print("  RESTORE: verified OK", file=sys.stderr)
+        return True
     print("  RESTORE: verify timeout — MANUAL CHECK REQUIRED", file=sys.stderr)
     return False
 
@@ -368,7 +389,7 @@ def main():
               file=sys.stderr)
 
     # ── Get live ranges from daemon ──
-    rc, status_out, status_err = run_cmd([DAEMON, "status"], timeout=15)
+    rc, status_out, status_err = run_cmd(daemon_cmd("status"), timeout=15)
     if rc != 0:
         sys.exit(f"error: r9700-tunerd status failed (rc={rc}): {status_err.strip()}")
     live = parse_status(status_out)
@@ -507,6 +528,15 @@ def main():
                 if len(errors_list) > 0:
                     gate_failures.append(
                         f"{len(errors_list)} harness error(s): {errors_list[:3]}")
+
+                # Gate 3a: the live value the harness measured after wake IS the target
+                pre = bench_data.get("pre_run", {})
+                if pre.get("vddgfx_offset_mv") != off:
+                    gate_failures.append(
+                        f"live offset after wake {pre.get('vddgfx_offset_mv')} != target {off}")
+                if pre.get("power_cap_w") is not None and abs(pre["power_cap_w"] - cap) >= 0.1:
+                    gate_failures.append(
+                        f"live cap after wake {pre.get('power_cap_w')} != target {cap}")
 
                 # Gate 3: offset and cap reported stable
                 if not agg.get("offset_stable", True):
