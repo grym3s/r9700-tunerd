@@ -559,10 +559,12 @@ class Handler(BaseHTTPRequestHandler):
         if not self._auth_ok():
             self._err(403, "invalid or missing token")
             return
-        # Balanced/Performance are placeholders until Phase 4 measures them.
+        # Efficiency = the Phase 4 result at 210 W (docs/MATRIX-2026-09-04.md):
+        # -50 mV captures the whole measured gain. Balanced/Performance keep
+        # the shallower -25 mV until -50 mV is measured at their caps.
         profiles = [
             {"name": "Stock", "offset_mv": 0, "cap_w": 300, "measured": False},
-            {"name": "Efficiency", "offset_mv": -25, "cap_w": 210, "measured": False},
+            {"name": "Efficiency", "offset_mv": -50, "cap_w": 210, "measured": False},
             {"name": "Balanced", "offset_mv": -25, "cap_w": 250, "measured": False},
             {"name": "Performance", "offset_mv": -25, "cap_w": 300, "measured": False},
         ]

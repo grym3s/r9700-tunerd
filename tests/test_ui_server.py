@@ -483,11 +483,11 @@ class TestApiBench:
 class TestApiProfiles:
     def test_efficiency_measured_when_bench_exists(self, server, fake_ui_tree):
         bench_dir = fake_ui_tree / "bench"
-        # Create a bench result matching Efficiency (offset=-25, cap=210)
+        # Create a bench result matching Efficiency (offset=-50, cap=210)
         (bench_dir / "eff-result.json").write_text(json.dumps({
             "label": "eff",
             "timestamp": "2025-06-01T00:00:00Z",
-            "pre_run": {"vddgfx_offset_mv": -25, "power_cap_w": 210},
+            "pre_run": {"vddgfx_offset_mv": -50, "power_cap_w": 210},
             "aggregates": {
                 "mean_gen_tok_s": 40.0, "agg_tok_s": 80.0,
                 "mean_power_w": 190.0, "tok_s_per_w": 0.42,
