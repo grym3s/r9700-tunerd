@@ -907,64 +907,168 @@ def cmd_discover(conf: dict) -> int:
     return 0
 
 
-def cmd_status(conf: dict) -> int:
+def _evict_guard_state(conf: dict, pci=None) -> dict:
+    """PM-safe snapshot of the eviction-guard state, in bytes.
+
+    Never reads mem_info_*, hwmon, or pp_* (safe to call regardless of
+    runtime_status). Used by both the human `status` line and `status --json`.
+
+    `status`/`doctor` run as their own process: they must never read
+    `_evict`, which is the daemon PROCESS's in-memory globals and is always
+    at its class defaults (holding=False, last_vram=0) here. The only things
+    this process has actually observed are the on-disk state file and live
+    sysfs, so everything below comes from those. `vram_used`/`gtt_total` are
+    None when unobserved, never a fabricated 0.
+    """
+    margin = conf.get("EVICT_GUARD_MARGIN", 0.90)
+    if not conf.get("EVICT_GUARD"):
+        return {"enabled": False, "holding": False, "vram_used": None,
+                "gtt_total": None, "margin": margin}
+    state_data = read_state()
+
+    def _int_field(key: str) -> int | None:
+        v = state_data.get(key)
+        if v is None:
+            return None
+        try:
+            return int(v)
+        except ValueError:
+            return None
+
+    vram = _int_field("vram_used")
+    gtt = _int_field("gtt_total")
+    if state_data:
+        holding = state_data.get("state") == "ACTIVE_HELD"
+    else:
+        # No state file at all (e.g. /run/r9700-tunerd was just lost): fall
+        # back to the one other thing we can observe directly.
+        holding = False
+        if pci is not None:
+            try:
+                holding = read_text(pci / "power" / "control") == "on"
+            except OSError:
+                holding = False
+    if gtt is None:
+        try:
+            for line in MEMINFO_PATH.read_text(encoding="utf-8").splitlines():
+                if line.startswith("MemTotal:"):
+                    gtt = (int(line.split()[1]) * 1024) // 2
+                    break
+        except (OSError, ValueError, IndexError):
+            gtt = None
+    return {"enabled": True, "holding": holding, "vram_used": vram,
+            "gtt_total": gtt, "margin": margin}
+
+
+def build_status_payload(conf: dict) -> dict:
+    """Build a machine-readable status snapshot (schema_version=1).
+
+    PM-safe: only reads power/control, power/runtime_status, power_state,
+    and (only while active) hwmon/pp_od_clk_voltage. While not active,
+    falls back to the cached /run/r9700-tunerd/ranges.json, exactly like
+    the human `status` output.
+    """
+    pci = discover(conf)
+    assert pci is not None
+    st = runtime_status(pci)
+    try:
+        control = read_text(pci / "power" / "control")
+    except OSError:
+        control = None
+    tuned = {
+        "offset_mv": conf.get("VOLTAGE_OFFSET_MV"),
+        "cap_w": conf.get("POWER_LIMIT_W"),
+    }
+    state_data = read_state()
+    payload = {
+        "schema_version": 1,
+        "pci": pci.name,
+        "runtime_status": st,
+        "power_state": power_state(pci),
+        "control": control,
+        "tuned": tuned,
+        "live": None,
+        "ranges": {
+            "source": None,
+            "cap_min_w": None,
+            "cap_max_w": None,
+            "cap_default_w": None,
+            "vo_min_mv": None,
+            "vo_max_mv": None,
+            "age_s": None,
+        },
+        "evict_guard": _evict_guard_state(conf, pci),
+        "state": state_data.get("state"),
+    }
+    if st != "active":
+        cached = load_ranges()
+        if cached is not None:
+            payload["ranges"].update(
+                source="cached",
+                cap_min_w=cached["cap_min_w"],
+                cap_max_w=cached["cap_max_w"],
+                cap_default_w=cached["cap_default_w"],
+                vo_min_mv=cached["vo_min_mv"],
+                vo_max_mv=cached["vo_max_mv"],
+                age_s=int(time.time()) - cached["ts"],
+            )
+        return payload
+    live: dict = {}
+    try:
+        cap = read_power_cap(pci)
+        live["cap_w"] = cap["cap"] / 1_000_000
+        live["cap_min_w"] = cap["min"] / 1_000_000
+        live["cap_max_w"] = cap["max"] / 1_000_000
+        live["cap_default_w"] = cap["default"] / 1_000_000
+    except Exception:
+        pass
+    try:
+        od = read_od(pci)
+        live["offset_mv"] = od["current_mv"]
+        live["vo_min_mv"] = od["min_mv"]
+        live["vo_max_mv"] = od["max_mv"]
+    except Exception:
+        pass
+    payload["live"] = live or None
+    if "cap_min_w" in live and "vo_min_mv" in live:
+        payload["ranges"].update(
+            source="live",
+            cap_min_w=live.get("cap_min_w"),
+            cap_max_w=live.get("cap_max_w"),
+            cap_default_w=live.get("cap_default_w"),
+            vo_min_mv=live.get("vo_min_mv"),
+            vo_max_mv=live.get("vo_max_mv"),
+            age_s=0,
+        )
+    return payload
+
+
+def cmd_status(conf: dict, *, as_json: bool = False) -> int:
+    if as_json:
+        payload = build_status_payload(conf)
+        print(json.dumps(payload))
+        return 0
     pci = discover(conf)
     assert pci is not None
     st = runtime_status(pci)
     print(f"pci={pci.name}")
     print(f"runtime_status={st}")
     print(f"power_state={power_state(pci)}")
-    if not conf.get("EVICT_GUARD"):
+    eg = _evict_guard_state(conf, pci)
+    if not eg["enabled"]:
         print("evict_guard=off")
     else:
-        # `status` runs as its own process: it must never read _evict, which
-        # is the daemon PROCESS's in-memory globals and is always at its
-        # class defaults (holding=False, last_vram=0) here. The only things
-        # this process has actually observed are the on-disk state file and
-        # live sysfs, so the label and figures below come from those, never
-        # from _evict.
-        state_data = read_state()
-        state_val = state_data.get("state")
-
-        def _int_field(key: str) -> int | None:
-            v = state_data.get(key)
-            if v is None:
-                return None
-            try:
-                return int(v)
-            except ValueError:
-                return None
-
-        vram = _int_field("vram_used")
-        gtt = _int_field("gtt_total")
-
-        if state_val == "ACTIVE_HELD":
-            label = "holding"
-        elif not state_data:
-            # No state file at all (e.g. /run/r9700-tunerd was just lost):
-            # fall back to the one other thing we can observe directly.
-            try:
-                control = read_text(pci / "power" / "control")
-            except OSError:
-                control = None
-            label = "holding (control=on)" if control == "on" else "idle"
+        if eg["holding"]:
+            # Label says where the evidence came from when the state file is
+            # missing and only power/control=on was observed.
+            label = "holding" if read_state() else "holding (control=on)"
         else:
             label = "idle"
-
-        if gtt is None:
-            try:
-                for line in MEMINFO_PATH.read_text(encoding="utf-8").splitlines():
-                    if line.startswith("MemTotal:"):
-                        gtt = (int(line.split()[1]) * 1024) // 2
-                        break
-            except (OSError, ValueError, IndexError):
-                gtt = None
-        vram_s = f"{vram/1e9:.1f}G" if vram is not None else "unknown"
-        gtt_s = f"{gtt/1e9:.1f}G" if gtt is not None else "unknown"
-        margin = conf.get("EVICT_GUARD_MARGIN", 0.90)
+        vram_s = f"{eg['vram_used']/1e9:.1f}G" if eg["vram_used"] is not None else "unknown"
+        gtt_s = f"{eg['gtt_total']/1e9:.1f}G" if eg["gtt_total"] is not None else "unknown"
         print(
             f"evict_guard={label} vram_used={vram_s} "
-            f"gtt_total={gtt_s} margin={margin:.2f}"
+            f"gtt_total={gtt_s} margin={eg['margin']:.2f}"
         )
     if st != "active":
         print("sensors=skipped (not active; refusing to wake)")
@@ -1055,6 +1159,7 @@ def cmd_reset(conf: dict) -> int:
     except RuntimeError as e:
         log(f"reset refused: {e}", syslog.LOG_ERR)
         return 1
+    failed = False
     try:
         cap = read_power_cap(pci)
         default_w = int(round(cap["default"] / 1_000_000))
@@ -1062,26 +1167,47 @@ def cmd_reset(conf: dict) -> int:
         log(f"power cap restored: {default_w} W")
     except Exception as e:
         log(f"power cap reset failed: {e}", syslog.LOG_ERR)
+        failed = True
     try:
         reset_od(pci)
         od = read_od(pci)
         log(f"VDDGFX offset reset: {od['current_mv']} mV")
     except Exception as e:
         log(f"OD reset failed: {e}", syslog.LOG_ERR)
-    return 0
+        failed = True
+    return 1 if failed else 0
+
+
+def _set_conf_values_text(text: str, values: dict[str, str]) -> str:
+    """Return *text* with each key in *values* set/appended, in order."""
+    for key, value in values.items():
+        pat = re.compile(rf"^{re.escape(key)}=.*$", re.M)
+        line = f"{key}={value}"
+        if pat.search(text):
+            text = pat.sub(line, text)
+        else:
+            if text and not text.endswith("\n"):
+                text += "\n"
+            text += line + "\n"
+    return text
 
 
 def set_conf_value(path: Path, key: str, value: str) -> None:
     """Atomically update one key in the config file."""
     text = path.read_text(encoding="utf-8") if path.is_file() else ""
-    pat = re.compile(rf"^{re.escape(key)}=.*$", re.M)
-    line = f"{key}={value}"
-    if pat.search(text):
-        text = pat.sub(line, text)
-    else:
-        if text and not text.endswith("\n"):
-            text += "\n"
-        text += line + "\n"
+    text = _set_conf_values_text(text, {key: value})
+    _atomic_write(path, text.encode("utf-8"))
+
+
+def set_conf_values(path: Path, values: dict[str, str]) -> None:
+    """Atomically update multiple keys in the config file with ONE write.
+
+    Every key is applied to the same in-memory text before the single
+    _atomic_write call, so a reader never observes a partially-updated
+    config (no window where one key is new and the other is stale).
+    """
+    text = path.read_text(encoding="utf-8") if path.is_file() else ""
+    text = _set_conf_values_text(text, values)
     _atomic_write(path, text.encode("utf-8"))
 
 
@@ -1150,6 +1276,87 @@ def cmd_set_power_cap(conf: dict, watts: int) -> int:
     log(f"config POWER_LIMIT_W={watts}")
     conf["POWER_LIMIT_W"] = watts  # keep validated-dict type (int)
     return cmd_apply(conf)
+
+
+def cmd_set_tuning(conf: dict, mv: int, watts: int) -> int:
+    """Atomically set VOLTAGE_OFFSET_MV and POWER_LIMIT_W together.
+
+    Both values are validated against ONE range snapshot (live ranges
+    when active, the cached ranges.json when suspended) before any
+    mutation. The config file is updated with a single _atomic_write
+    (set_conf_values). When active, apply is attempted once; on any
+    failure the prior config is restored (also via a single atomic
+    write) before returning nonzero.
+    """
+    if mv > 0:
+        die("VDDGFX offset must be <= 0 mV")
+    pci = discover(conf)
+    assert pci is not None
+
+    if is_active(pci):
+        od = read_od(pci)
+        cap = read_power_cap(pci)
+        if od["min_mv"] is not None and mv < od["min_mv"]:
+            die(f"{mv} mV below live min {od['min_mv']} mV")
+        if od["max_mv"] is not None and mv > od["max_mv"]:
+            die(f"{mv} mV above live max {od['max_mv']} mV")
+        min_w = cap["min"] / 1_000_000
+        max_w = cap["max"] / 1_000_000
+        if watts < min_w or watts > max_w:
+            die(f"{watts} W outside live range {min_w:.0f}..{max_w:.0f} W")
+        if od["min_mv"] is not None and od["max_mv"] is not None:
+            save_ranges(cap, od)
+        log(
+            "set-tuning: validated against live ranges "
+            f"vo={od['min_mv']}..{od['max_mv']} mV cap={min_w:.0f}..{max_w:.0f} W"
+        )
+    else:
+        cached = load_ranges()
+        if cached is None:
+            die("card is suspended and no cached range is available; run a workload once so the watcher can record the live range, then retry")
+        if mv < cached["vo_min_mv"] or mv > cached["vo_max_mv"]:
+            die(f"{mv} mV outside cached range {cached['vo_min_mv']}..{cached['vo_max_mv']} mV")
+        if watts < cached["cap_min_w"] or watts > cached["cap_max_w"]:
+            die(f"{watts} W outside cached range {cached['cap_min_w']:.0f}..{cached['cap_max_w']:.0f} W")
+        log(
+            "set-tuning: validated against cached ranges "
+            f"vo={cached['vo_min_mv']}..{cached['vo_max_mv']} mV "
+            f"cap={cached['cap_min_w']:.0f}..{cached['cap_max_w']:.0f} W"
+        )
+
+    # Runtime-PM write guard: die before touching the config file.
+    try:
+        require_runtime_pm(pci)
+    except RuntimeError as e:
+        die(str(e))
+
+    prior_mv = conf["VOLTAGE_OFFSET_MV"]
+    prior_watts = conf["POWER_LIMIT_W"]
+
+    set_conf_values(CONF_PATH, {
+        "VOLTAGE_OFFSET_MV": str(mv),
+        "POWER_LIMIT_W": str(watts),
+    })
+    log(f"config VOLTAGE_OFFSET_MV={mv} POWER_LIMIT_W={watts}")
+    conf["VOLTAGE_OFFSET_MV"] = mv
+    conf["POWER_LIMIT_W"] = watts
+
+    rc = cmd_apply(conf)
+    if rc != 0:
+        # Restore the prior config atomically and report failure.
+        log(
+            f"set-tuning: apply failed, restoring prior config "
+            f"VOLTAGE_OFFSET_MV={prior_mv} POWER_LIMIT_W={prior_watts}",
+            syslog.LOG_ERR,
+        )
+        set_conf_values(CONF_PATH, {
+            "VOLTAGE_OFFSET_MV": str(prior_mv),
+            "POWER_LIMIT_W": str(prior_watts),
+        })
+        conf["VOLTAGE_OFFSET_MV"] = prior_mv
+        conf["POWER_LIMIT_W"] = prior_watts
+        return rc
+    return 0
 
 
 def handle_wake(pci: Path, conf: dict, cap_checked: bool) -> bool:
@@ -1520,7 +1727,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-c", "--config", default=str(CONF_PATH))
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("discover")
-    sub.add_parser("status")
+    st = sub.add_parser("status")
+    st.add_argument("--json", action="store_true", dest="json_out",
+                     help="emit machine-readable JSON (schema_version=1)")
     sub.add_parser("apply")
     sub.add_parser("watch")
     sub.add_parser("reset")
@@ -1529,6 +1738,11 @@ def build_parser() -> argparse.ArgumentParser:
     su.add_argument("mv", type=int, help="VDDGFX offset in mV, e.g. -25")
     spc = sub.add_parser("set-power-cap")
     spc.add_argument("watts", type=int, help="Power cap in watts, e.g. 250")
+    stn = sub.add_parser("set-tuning")
+    stn.add_argument("--offset-mv", type=int, required=True,
+                      help="VDDGFX offset in mV, e.g. -25")
+    stn.add_argument("--cap-w", type=int, required=True,
+                      help="Power cap in watts, e.g. 250")
     sp = sub.add_parser("probe-poll")
     sp.add_argument("--seconds", type=int, default=30)
     return p
@@ -1553,7 +1767,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "discover":
         return cmd_discover(conf)
     if args.cmd == "status":
-        return cmd_status(conf)
+        return cmd_status(conf, as_json=args.json_out)
     if args.cmd == "apply":
         return cmd_apply(conf)
     if args.cmd == "watch":
@@ -1566,6 +1780,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_set_undervolt(conf, args.mv)
     if args.cmd == "set-power-cap":
         return cmd_set_power_cap(conf, args.watts)
+    if args.cmd == "set-tuning":
+        return cmd_set_tuning(conf, args.offset_mv, args.cap_w)
     if args.cmd == "probe-poll":
         return cmd_probe_poll(conf, seconds=args.seconds)
     return 2

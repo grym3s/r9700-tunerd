@@ -801,9 +801,15 @@ class Handler(BaseHTTPRequestHandler):
                 return
         # All fields valid — only now may we touch the CLI.
         steps = []
-        if offset is not None:
+        if offset is not None and cap is not None:
+            # Both values: one atomic set-tuning call (single config write,
+            # single range-validation snapshot, restore-on-failure in the
+            # daemon) instead of two separate mutations.
+            steps.append(self._run_cli(
+                "set-tuning", "--offset-mv", str(offset), "--cap-w", str(cap)))
+        elif offset is not None:
             steps.append(self._run_cli("set-undervolt", str(offset)))
-        if cap is not None:
+        elif cap is not None:
             steps.append(self._run_cli("set-power-cap", str(cap)))
         ok = all(s["rc"] == 0 for s in steps)
         self._json(200, {"ok": ok, "steps": steps})

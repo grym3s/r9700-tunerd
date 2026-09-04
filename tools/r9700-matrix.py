@@ -217,14 +217,10 @@ def verify_readback(offset_mv: int, cap_w: int, timeout: float = 10.0) -> bool:
 
 
 def apply_and_verify(offset_mv: int, cap_w: int) -> bool:
-    """Apply offset + cap via daemon CLI, then verify readback (retry ≤ 10 s)."""
-    rc, _, err = run_cmd(daemon_cmd("set-undervolt", str(offset_mv)), timeout=15)
+    """Apply offset + cap via daemon CLI (atomic set-tuning), then verify readback (retry ≤ 10 s)."""
+    rc, _, err = run_cmd(daemon_cmd("set-tuning", "--offset-mv", str(offset_mv), "--cap-w", str(cap_w)), timeout=15)
     if rc != 0:
-        print(f"  FAIL: set-undervolt {offset_mv} → rc={rc} {err.strip()}", file=sys.stderr)
-        return False
-    rc, _, err = run_cmd(daemon_cmd("set-power-cap", str(cap_w)), timeout=15)
-    if rc != 0:
-        print(f"  FAIL: set-power-cap {cap_w} → rc={rc} {err.strip()}", file=sys.stderr)
+        print(f"  FAIL: set-tuning offset={offset_mv} cap={cap_w} → rc={rc} {err.strip()}", file=sys.stderr)
         return False
     # Verify readback matches target (retry up to 10 s)
     if verify_readback(offset_mv, cap_w):
@@ -236,14 +232,10 @@ def apply_and_verify(offset_mv: int, cap_w: int) -> bool:
 
 def restore_safe_point(offset_mv: int, cap_w: int) -> bool:
     """Restore the previous safe point and verify the readback."""
-    print(f"  RESTORE: set-undervolt {offset_mv} mV, set-power-cap {cap_w} W", file=sys.stderr)
-    rc, _, err = run_cmd(daemon_cmd("set-undervolt", str(offset_mv)), timeout=15)
+    print(f"  RESTORE: set-tuning --offset-mv {offset_mv} --cap-w {cap_w}", file=sys.stderr)
+    rc, _, err = run_cmd(daemon_cmd("set-tuning", "--offset-mv", str(offset_mv), "--cap-w", str(cap_w)), timeout=15)
     if rc != 0:
-        print(f"  RESTORE FAIL: set-undervolt rc={rc} {err.strip()}", file=sys.stderr)
-        return False
-    rc, _, err = run_cmd(daemon_cmd("set-power-cap", str(cap_w)), timeout=15)
-    if rc != 0:
-        print(f"  RESTORE FAIL: set-power-cap rc={rc} {err.strip()}", file=sys.stderr)
+        print(f"  RESTORE FAIL: set-tuning rc={rc} {err.strip()}", file=sys.stderr)
         return False
     if verify_readback(offset_mv, cap_w):
         print("  RESTORE: verified OK", file=sys.stderr)
@@ -453,7 +445,7 @@ def main():
         print(f"{'─'*60}")
         for i, (off, cap, r) in enumerate(plan, 1):
             label = f"vo{off}_cap{cap}_r{r}"
-            print(f"  {i:2d}. {DAEMON} set-undervolt {off}  &&  {DAEMON} set-power-cap {cap}")
+            print(f"  {i:2d}. {DAEMON} set-tuning --offset-mv {off} --cap-w {cap}")
             print(f"      {DAEMON} status   (verify readback)")
             print(f"      python3 {args.bench} run --endpoint … --label {label} --out {out_dir}")
             print(f"      gates → append {MATRIX_CSV} → wait D3cold")
