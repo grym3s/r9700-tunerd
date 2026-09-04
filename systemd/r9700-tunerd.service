@@ -19,6 +19,12 @@ Nice=10
 # Sysfs-only daemon: never opens DRM/render nodes. Hardening below keeps root's
 # write surface to /sys (OD, hwmon) and its own runtime directory.
 RuntimeDirectory=r9700-tunerd
+# Keep /run/r9700-tunerd alive across the oneshot's own start/stop cycles
+# (udev re-binds the PCI device mid-session): without this, systemd tears
+# the bind-mounted runtime dir down whenever ANY unit that declares it stops,
+# and ProtectSystem=strict then makes /run read-only so it can never come
+# back until this watcher itself restarts.
+RuntimeDirectoryPreserve=yes
 NoNewPrivileges=yes
 ProtectHome=yes
 ProtectSystem=strict

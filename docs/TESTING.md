@@ -118,7 +118,8 @@ Prerequisite: GPU VRAM is available and not in use by another process.
    PCI device path from the output, and then read the control sysfs file at that path; it
    should show "on" (held by eviction guard).
 6. Verify daemon status: `r9700-tunerd status` should show `runtime_status=active` (GPU
-   held awake by the guard).
+   held awake by the guard) and `evict_guard=holding` (derived from the on-disk state
+   file, which the daemon just wrote with state=ACTIVE_HELD).
 7. Unload the model from VRAM.
 8. Check daemon logs: should see "evict-guard: released hold — VRAM X.XG < 72% of
    GTT X.XG" (80% of 90% = 72%).

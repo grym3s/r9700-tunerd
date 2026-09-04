@@ -554,9 +554,14 @@ def test_cmd_status_evict_guard_idle(fake_tree, monkeypatch, capsys):
     parsed, problems = rt.validate_conf(raw)
     assert not problems
 
-    rt._evict.holding = False
-    rt._evict.last_vram = 100_000_000
-    rt._evict.last_gtt = 1_000_000_000
+    # State file present but not held: status must read this, not any
+    # in-process _evict globals (those belong to the daemon process, not
+    # this one).
+    rt.STATE_DIR.mkdir(parents=True, exist_ok=True)
+    (rt.STATE_DIR / "state").write_text(
+        "pci=0000:aa:00.0\nstate=ACTIVE_CONFIGURED\nvram_used=100000000\n"
+        "gtt_total=1000000000\nts=1\n"
+    )
 
     result = rt.cmd_status(parsed)
     assert result == 0
@@ -582,15 +587,51 @@ def test_cmd_status_evict_guard_holding(fake_tree, monkeypatch, capsys):
     parsed, problems = rt.validate_conf(raw)
     assert not problems
 
-    rt._evict.holding = True
-    rt._evict.last_vram = 900_000_000
-    rt._evict.last_gtt = 1_000_000_000
+    # This is the acceptance-test regression: cmd_status() must derive the
+    # label from the on-disk state file (state=ACTIVE_HELD), never from
+    # _evict.holding, which is always False/default in the status process.
+    rt.STATE_DIR.mkdir(parents=True, exist_ok=True)
+    (rt.STATE_DIR / "state").write_text(
+        "pci=0000:aa:00.0\nstate=ACTIVE_HELD\nvram_used=900000000\n"
+        "gtt_total=1000000000\nts=1\n"
+    )
+    assert rt._evict.holding is False  # sanity: default, never touched
 
     result = rt.cmd_status(parsed)
     assert result == 0
     out = capsys.readouterr().out
     assert "evict_guard=holding" in out
     assert "vram_used=0.9G" in out
+    assert "gtt_total=1.0G" in out
+
+
+def test_cmd_status_evict_guard_holding_no_state_file(fake_tree, capsys):
+    """State file missing entirely (e.g. /run/r9700-tunerd lost) but the
+    daemon is actively holding: fall back to power/control==on rather than
+    printing a fabricated 'idle'."""
+    raw = {
+        "VENDOR": "0x1002",
+        "DEVICE": "0x7551",
+        "SUBSYSTEM_VENDOR": "0x1043",
+        "SUBSYSTEM_DEVICE": "0x0626",
+        "POWER_LIMIT_W": "210",
+        "VOLTAGE_OFFSET_MV": "0",
+        "POLL_INTERVAL_S": "2",
+        "EVICT_GUARD": "1",
+        "EVICT_GUARD_MARGIN": "0.90",
+    }
+    parsed, problems = rt.validate_conf(raw)
+    assert not problems
+    assert not (rt.STATE_DIR / "state").exists()
+
+    pci = rt.PCI_ROOT / "0000:aa:00.0"
+    (pci / "power" / "control").write_text("on\n")
+
+    result = rt.cmd_status(parsed)
+    assert result == 0
+    out = capsys.readouterr().out
+    assert "evict_guard=holding (control=on)" in out
+    assert "vram_used=unknown" in out
 
 
 def test_cmd_status_never_reads_gtt_sysfs(fake_tree, conf, monkeypatch, capsys):
@@ -605,10 +646,64 @@ def test_cmd_status_never_reads_gtt_sysfs(fake_tree, conf, monkeypatch, capsys):
         return 1000
 
     monkeypatch.setattr(rt, "gtt_total_bytes", _tracked_gtt)
-    rt._evict.holding = False
-    rt._evict.last_vram = 0
-    rt._evict.last_gtt = 500_000_000
+    rt.STATE_DIR.mkdir(parents=True, exist_ok=True)
+    (rt.STATE_DIR / "state").write_text(
+        "pci=0000:aa:00.0\nstate=ACTIVE_CONFIGURED\nvram_used=0\n"
+        "gtt_total=500000000\nts=1\n"
+    )
 
     result = rt.cmd_status(raw)
     assert result == 0
     assert calls["gtt"] == 0
+
+
+# ---------------------------------------------------------------------------
+# write_state: warn-once on OSError (DEFECT 1 — /run/r9700-tunerd disappearing
+# must not be silently swallowed forever).
+# ---------------------------------------------------------------------------
+
+
+def test_write_state_warns_once_on_failure(fake_tree, log_recorder, monkeypatch):
+    """A vanished/read-only STATE_DIR fails every write, but only the first
+    failure logs a WARNING; subsequent failures stay silent until a write
+    succeeds again."""
+    monkeypatch.setattr(rt, "_state_write_warned", False)
+
+    # Point STATE_DIR at a path that can never be created: its parent is a
+    # regular file, so STATE_DIR.mkdir() always raises NotADirectoryError
+    # (an OSError subclass), simulating /run being read-only post-boot.
+    blocker = rt.STATE_DIR.parent / "blocker"
+    blocker.write_text("not a directory\n")
+    monkeypatch.setattr(rt, "STATE_DIR", blocker / "r9700-tunerd")
+
+    rt.write_state("pci=0000:aa:00.0\nstate=SUSPENDED\nts=1\n")
+    rt.write_state("pci=0000:aa:00.0\nstate=SUSPENDED\nts=2\n")
+    rt.write_state("pci=0000:aa:00.0\nstate=SUSPENDED\nts=3\n")
+
+    warnings = [msg for level, msg in log_recorder if level == rt.syslog.LOG_WARNING]
+    assert len(warnings) == 1
+    assert "state write failed" in warnings[0]
+
+
+def test_write_state_warns_again_after_recovery(fake_tree, log_recorder, monkeypatch):
+    """Once a write succeeds, the warn-once latch resets so a later failure
+    (e.g. another udev re-bind tearing the dir down again) is not silent."""
+    monkeypatch.setattr(rt, "_state_write_warned", False)
+
+    blocker = rt.STATE_DIR.parent / "blocker"
+    blocker.write_text("not a directory\n")
+    real_state_dir = rt.STATE_DIR
+    monkeypatch.setattr(rt, "STATE_DIR", blocker / "r9700-tunerd")
+
+    rt.write_state("pci=0000:aa:00.0\nstate=SUSPENDED\nts=1\n")
+
+    # Recover: point STATE_DIR back at a writable location.
+    monkeypatch.setattr(rt, "STATE_DIR", real_state_dir)
+    rt.write_state("pci=0000:aa:00.0\nstate=SUSPENDED\nts=2\n")
+
+    # Fail again after recovery.
+    monkeypatch.setattr(rt, "STATE_DIR", blocker / "r9700-tunerd")
+    rt.write_state("pci=0000:aa:00.0\nstate=SUSPENDED\nts=3\n")
+
+    warnings = [msg for level, msg in log_recorder if level == rt.syslog.LOG_WARNING]
+    assert len(warnings) == 2

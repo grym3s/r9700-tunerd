@@ -7,6 +7,10 @@ Type=oneshot
 ExecStart=/usr/local/sbin/r9700-tunerd apply
 Nice=10
 RuntimeDirectory=r9700-tunerd
+# See r9700-tunerd.service: without Preserve, this oneshot's own exit tears
+# down /run/r9700-tunerd (removing state/ranges the watcher just wrote), and
+# a udev re-bind can run this unit again mid-session.
+RuntimeDirectoryPreserve=yes
 NoNewPrivileges=yes
 ProtectHome=yes
 ProtectSystem=strict

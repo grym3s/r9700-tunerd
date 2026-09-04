@@ -42,6 +42,10 @@ class _EvictGuardState:
 
 _evict = _EvictGuardState()
 
+# Set the first time write_state() fails, so the warning is logged once
+# (not per poll) instead of silently swallowing every OSError forever.
+_state_write_warned = False
+
 # Fallback only if a key is missing from config. Never treat these as the
 # live policy; /etc/r9700-tunerd.conf is the source of truth.
 DEFAULTS = {
@@ -671,6 +675,7 @@ def write_state(payload: str = "", *, state: str | None = None, pci=None,
       - write_state(state=..., pci=..., vo=..., ...)   — builds the payload
         from keyword fields, adding vram_used/gtt_total when given.
     """
+    global _state_write_warned
     if not payload:
         lines = []
         if pci is not None:
@@ -690,8 +695,16 @@ def write_state(payload: str = "", *, state: str | None = None, pci=None,
     try:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         _atomic_write(STATE_DIR / "state", payload.encode("utf-8"))
-    except OSError:
-        pass
+    except OSError as e:
+        if not _state_write_warned:
+            _state_write_warned = True
+            log(
+                f"state write failed, dashboard/status will show stale/null "
+                f"data until this recovers: {STATE_DIR}: {e}",
+                syslog.LOG_WARNING,
+            )
+    else:
+        _state_write_warned = False
 
 
 def read_state() -> dict[str, str]:
@@ -904,28 +917,54 @@ def cmd_status(conf: dict) -> int:
     if not conf.get("EVICT_GUARD"):
         print("evict_guard=off")
     else:
+        # `status` runs as its own process: it must never read _evict, which
+        # is the daemon PROCESS's in-memory globals and is always at its
+        # class defaults (holding=False, last_vram=0) here. The only things
+        # this process has actually observed are the on-disk state file and
+        # live sysfs, so the label and figures below come from those, never
+        # from _evict.
         state_data = read_state()
-        vram = _evict.last_vram
-        gtt = _evict.last_gtt
-        if not gtt:
+        state_val = state_data.get("state")
+
+        def _int_field(key: str) -> int | None:
+            v = state_data.get(key)
+            if v is None:
+                return None
             try:
-                gtt = int(state_data.get("gtt_total", 0))
+                return int(v)
             except ValueError:
-                gtt = 0
-        if not gtt:
-            gtt = 0
+                return None
+
+        vram = _int_field("vram_used")
+        gtt = _int_field("gtt_total")
+
+        if state_val == "ACTIVE_HELD":
+            label = "holding"
+        elif not state_data:
+            # No state file at all (e.g. /run/r9700-tunerd was just lost):
+            # fall back to the one other thing we can observe directly.
+            try:
+                control = read_text(pci / "power" / "control")
+            except OSError:
+                control = None
+            label = "holding (control=on)" if control == "on" else "idle"
+        else:
+            label = "idle"
+
+        if gtt is None:
             try:
                 for line in MEMINFO_PATH.read_text(encoding="utf-8").splitlines():
                     if line.startswith("MemTotal:"):
                         gtt = (int(line.split()[1]) * 1024) // 2
                         break
             except (OSError, ValueError, IndexError):
-                gtt = 0
+                gtt = None
+        vram_s = f"{vram/1e9:.1f}G" if vram is not None else "unknown"
+        gtt_s = f"{gtt/1e9:.1f}G" if gtt is not None else "unknown"
         margin = conf.get("EVICT_GUARD_MARGIN", 0.90)
-        label = "holding" if _evict.holding else "idle"
         print(
-            f"evict_guard={label} vram_used={vram/1e9:.1f}G "
-            f"gtt_total={gtt/1e9:.1f}G margin={margin:.2f}"
+            f"evict_guard={label} vram_used={vram_s} "
+            f"gtt_total={gtt_s} margin={margin:.2f}"
         )
     if st != "active":
         print("sensors=skipped (not active; refusing to wake)")
