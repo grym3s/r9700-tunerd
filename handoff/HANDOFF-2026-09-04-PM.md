@@ -16,7 +16,7 @@ the owner's cold shutdown.
 | Config | `-50 mV / 210 W` (adopted at 09:50 after the matrix), `EVICT_GUARD=1`, `EVICT_GUARD_MARGIN=0.90` |
 | Ray's model | **not loaded** (must stay unloaded until the guard acceptance below) |
 | Halo's server | running, iGPU, `-c 131072 -ctk q8_0 -ctv q8_0 --reasoning-budget 8192`, pinned to the iGPU by `MESA_VK_DEVICE_SELECT=1002:1586!` |
-| BIOS carve-out | 96 GB (owner chose to keep it; the guard is the mitigation) |
+| BIOS carve-out | 96 GB. **Settled, not up for discussion**: the owner keeps 96 GB; the eviction guard is the fix. Do not propose 64 GB again. |
 | USB Wi-Fi | **fixed**: USB 2.0 mode + other controller; zero faults since 15:33 |
 | License | MIT (`LICENSE`, commit `5cd8571`) |
 | GitHub | `origin` = github.com/grym3s/r9700-tunerd, **nothing pushed**; publish only from a sanitized history |
@@ -130,7 +130,6 @@ the owner's cold shutdown.
 - Whether Halo may be used as a builder again (currently benchmarking).
 - Whether Ray may be used once the guard acceptance passes (it makes Ray
   safe by construction: the card never sleeps with the model resident).
-- Carve-out: stay at 96 GB with the guard, or back to 64 GB.
 - When to publish: after license (done), history sanitisation, secrets and
   path audit, and the R0.1 acceptance.
 

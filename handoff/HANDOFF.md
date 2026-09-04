@@ -326,10 +326,11 @@ Mechanism (measured, see kernel `Memory:` and `VRAM:` lines per boot): at
    cache for two 20 GB model files) now has 32 GB minus the above. Boot -1
    is the OOM killer taking the GPU apps out one by one, then the desktop.
 
-Fix (owner, BIOS rule): set the UMA carve-out back to 64 GB. Halo's Q6
-model uses ~27 GB of it, so 64 GB is ample. Until that is done: do not load
-Ray's model on the R9700, or the next sleep/wake will hang the machine
-again. `lms ps` shows it is not loaded on the current boot.
+The carve-out stays at 96 GB. That is the owner's settled decision
+(restated emphatically the same evening); reverting to 64 GB is **not** an
+option and must not be proposed again. The fix is the eviction guard below.
+Until its hardware acceptance passes: do not load Ray's model on the R9700,
+or the next sleep/wake will hang the machine again.
 
 Owner decision (2026-09-04 ~14:50, after being offered A: BIOS back to
 64 GB, B: daemon holds the card awake while VRAM > stageable GTT, C: smaller
