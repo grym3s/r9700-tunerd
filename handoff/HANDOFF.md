@@ -185,7 +185,17 @@ Evidence, all from 2026-09-04 10:06–10:08 local:
   (the compositor pings unresponsive windows). The orchestrator killed the
   dialog at ~10:10.
 
-What to do next (cheapest first):
+**Soak result (11:01–11:06, app window open throughout, launched via the
+menu path):** one wake in five minutes, at the moment a second app instance
+was launched (11:05:40, asleep again 11 s later); no 13 s loop. A single
+short wake per app launch is expected: GTK/WebKit's EGL initialisation
+enumerates DRM render nodes and touching `renderD128` takes a PM reference
+for the 5 s autosuspend window. That is a launch cost, not a hold. The
+13 s loop has not recurred since the stale ANR dialog was removed. Parent-
+death cleanup of a spawned server was tested (SIGKILL the app, server
+exited, port closed: PASS).
+
+What to do next if the loop is ever seen again (cheapest first):
 
 1. Launch the app from the menu, leave it open for 5 minutes, then
    `journalctl -t r9700-tunerd --since "5 min ago" | grep -E "active|suspended"`.
