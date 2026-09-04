@@ -13,22 +13,44 @@ from __future__ import annotations
 
 import argparse
 import errno
+import io
 import json
 import os
+import platform
 import re
 import signal
 import subprocess
 import sys
 import syslog
+import tarfile
 import tempfile
 import time
 from pathlib import Path
+
+__version__ = "0.1.0"
 
 CONF_PATH = Path("/etc/r9700-tunerd.conf")
 STATE_DIR = Path("/run/r9700-tunerd")
 RANGES_PATH = STATE_DIR / "ranges.json"
 PCI_ROOT = Path("/sys/bus/pci/devices")
 SYSLOG_IDENT = "r9700-tunerd"
+INSTALLED_DAEMON_PATH = Path("/usr/local/sbin/r9700-tunerd")
+SUDOERS_RULE_PATH = Path("/etc/sudoers.d/r9700-tunerd")
+
+# Sysfs leaf names that must never be *read* (contents) while the card is
+# not runtime-active. doctor only ever checks existence of these, never
+# their contents, regardless of runtime_status.
+UNSAFE_SYSFS_LEAVES = (
+    "pp_od_clk_voltage",
+    "pp_power_profile_mode",
+    "mem_info_gtt_total",
+    "mem_info_vram_used",
+    "mem_info_vram_total",
+    "gpu_busy_percent",
+)
+
+_HOME_PATH_RE = re.compile(r"/home/[^/\s]+")
+_TOKEN_RE = re.compile(r"\b[0-9a-fA-F]{32}\b")
 
 
 class _EvictGuardState:
@@ -907,6 +929,217 @@ def cmd_discover(conf: dict) -> int:
     return 0
 
 
+def _amdgpu_module_present() -> bool:
+    """Existence check only: /sys/module/amdgpu, not a PCI-device read."""
+    try:
+        return Path("/sys/module/amdgpu").is_dir()
+    except OSError:
+        return False
+
+
+def _systemd_present() -> bool:
+    return Path("/run/systemd/system").exists()
+
+
+def _unit_states(units: tuple[str, ...] = ("r9700-tunerd.service",)) -> dict:
+    """systemctl is-active/is-enabled per unit. Never reads unit file contents."""
+    out: dict[str, dict] = {}
+    for unit in units:
+        active = "unknown"
+        enabled = "unknown"
+        try:
+            r = subprocess.run(["systemctl", "is-active", unit],
+                                capture_output=True, text=True, timeout=5)
+            active = r.stdout.strip() or "unknown"
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        try:
+            r = subprocess.run(["systemctl", "is-enabled", unit],
+                                capture_output=True, text=True, timeout=5)
+            enabled = r.stdout.strip() or "unknown"
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        out[unit] = {"active": active, "enabled": enabled}
+    return out
+
+
+def _sudoers_rule_present() -> bool:
+    """Existence only. Never reads/prints the rule's contents."""
+    try:
+        return SUDOERS_RULE_PATH.is_file()
+    except OSError:
+        return False
+
+
+def _version_info() -> dict:
+    """Repo (this script's) __version__ vs the installed daemon's, by regex.
+
+    Reading the installed script is a plain file read (not sysfs, not
+    hardware); it is never executed and sudo is never used.
+    """
+    installed_version = None
+    if INSTALLED_DAEMON_PATH.is_file():
+        try:
+            text = INSTALLED_DAEMON_PATH.read_text(encoding="utf-8", errors="replace")
+            m = re.search(r'__version__\s*=\s*"([^"]+)"', text)
+            installed_version = m.group(1) if m else None
+        except OSError:
+            installed_version = None
+    return {
+        "repo": __version__,
+        "installed": installed_version,
+        "installed_path": str(INSTALLED_DAEMON_PATH),
+        "match": installed_version == __version__ if installed_version else None,
+    }
+
+
+def _capability_inventory(pci: Path) -> dict:
+    """Which sysfs files exist under the device, by path.exists() only.
+
+    Never opens/reads any of these. Safe to call regardless of
+    runtime_status, and it is the only thing doctor ever does with the
+    unsafe set while the card is asleep.
+    """
+    inv = {name: (pci / name).exists() for name in UNSAFE_SYSFS_LEAVES}
+    inv["hwmon"] = (pci / "hwmon").is_dir()
+    return inv
+
+
+def build_doctor_payload(conf: dict) -> dict:
+    """PM-safe diagnostics snapshot (schema_version=1).
+
+    While runtime_status != active, only power/control, runtime_status,
+    power_state, and power/runtime_suspended_time are read from the PCI
+    device; the capability inventory is existence-only. Never opens
+    /dev/dri/*, never reads hwmon/pp_*/mem_info_*/gpu_busy_percent.
+    """
+    pci = discover(conf)
+    assert pci is not None
+    st = runtime_status(pci)
+    try:
+        control = read_text(pci / "power" / "control")
+    except OSError:
+        control = None
+    ids = pci_ids(pci) or (None, None, None, None)
+    payload = {
+        "schema_version": 1,
+        "version": _version_info(),
+        "platform": {
+            "system": platform.system(),
+            "release": platform.release(),
+            "machine": platform.machine(),
+            "python": sys.version.split()[0],
+        },
+        "systemd_present": _systemd_present(),
+        "amdgpu_module": _amdgpu_module_present(),
+        "identity": {
+            "want": {
+                "vendor": norm_hex(conf["VENDOR"]),
+                "device": norm_hex(conf["DEVICE"]),
+                "subsystem_vendor": norm_hex(conf["SUBSYSTEM_VENDOR"]),
+                "subsystem_device": norm_hex(conf["SUBSYSTEM_DEVICE"]),
+            },
+            "matched": {
+                "vendor": ids[0],
+                "device": ids[1],
+                "subsystem_vendor": ids[2],
+                "subsystem_device": ids[3],
+            },
+            "pci": pci.name,
+        },
+        "runtime_pm": {
+            "control": control,
+            "runtime_status": st,
+            "power_state": power_state(pci),
+            "runtime_suspended_ms": runtime_suspended_ms(pci),
+        },
+        "capabilities": _capability_inventory(pci),
+        "units": _unit_states(),
+        "sudoers_rule_present": _sudoers_rule_present(),
+        "evict_guard": _evict_guard_state(conf, pci),
+        "state": read_state().get("state"),
+    }
+    return payload
+
+
+def cmd_doctor(conf: dict, *, as_json: bool = False) -> int:
+    payload = build_doctor_payload(conf)
+    if as_json:
+        print(json.dumps(payload))
+        return 0
+    v = payload["version"]
+    print(f"version: repo={v['repo']} installed={v['installed']} match={v['match']}")
+    p = payload["platform"]
+    print(f"platform: {p['system']} {p['release']} ({p['machine']}) python={p['python']}")
+    print(f"systemd_present={payload['systemd_present']} amdgpu_module={payload['amdgpu_module']}")
+    ident = payload["identity"]
+    matched = tuple(ident["matched"].values()) == tuple(ident["want"].values())
+    print(f"identity: pci={ident['pci']} match={matched} want={ident['want']} matched={ident['matched']}")
+    rp = payload["runtime_pm"]
+    print(
+        f"runtime_pm: control={rp['control']} runtime_status={rp['runtime_status']} "
+        f"power_state={rp['power_state']} runtime_suspended_ms={rp['runtime_suspended_ms']}"
+    )
+    print("capabilities: " + ", ".join(f"{k}={v}" for k, v in payload["capabilities"].items()))
+    for unit, st in payload["units"].items():
+        print(f"unit {unit}: active={st['active']} enabled={st['enabled']}")
+    print(f"sudoers_rule_present={payload['sudoers_rule_present']}")
+    eg = payload["evict_guard"]
+    print(f"evict_guard: enabled={eg['enabled']} holding={eg['holding']} margin={eg['margin']}")
+    print(f"state={payload['state']}")
+    return 0
+
+
+def _redact_text(text: str) -> str:
+    """Rewrite /home/<user> -> ~ and strip anything that looks like a
+    dashboard token (32 hex chars, matching secrets.token_hex(16))."""
+    text = _HOME_PATH_RE.sub("~", text)
+    text = _TOKEN_RE.sub("<REDACTED>", text)
+    return text
+
+
+def _bundle_entries(conf: dict) -> list[tuple[str, bytes]]:
+    """Build the redacted support-bundle file list as (arcname, bytes)."""
+    entries: list[tuple[str, bytes]] = []
+    payload = build_doctor_payload(conf)
+    entries.append(("doctor.json", json.dumps(payload, indent=2).encode("utf-8")))
+    try:
+        conf_text = CONF_PATH.read_text(encoding="utf-8", errors="replace")
+        entries.append(("r9700-tunerd.conf", _redact_text(conf_text).encode("utf-8")))
+    except OSError:
+        pass
+    try:
+        r = subprocess.run(
+            ["journalctl", "-t", SYSLOG_IDENT, "-n", "200", "--no-pager", "-o", "short-iso"],
+            capture_output=True, text=True, timeout=5,
+        )
+        entries.append(("journal.txt", _redact_text(r.stdout).encode("utf-8")))
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return entries
+
+
+def cmd_doctor_bundle(conf: dict, path: Path | None, *, preview: bool) -> int:
+    """Write (or, with preview, just list) a redacted support-bundle tarball.
+
+    No tokens, serials, or unrelated logs; /home/<user> is rewritten to ~.
+    There is never any automatic upload.
+    """
+    entries = _bundle_entries(conf)
+    if preview or path is None:
+        for name, data in entries:
+            print(f"{name}\t{len(data)} bytes")
+        return 0
+    with tarfile.open(path, "w:gz") as tf:
+        for name, data in entries:
+            info = tarfile.TarInfo(name=name)
+            info.size = len(data)
+            info.mtime = int(time.time())
+            tf.addfile(info, io.BytesIO(data))
+    print(f"wrote {path}")
+    return 0
+
+
 def _evict_guard_state(conf: dict, pci=None) -> dict:
     """PM-safe snapshot of the eviction-guard state, in bytes.
 
@@ -1745,6 +1978,13 @@ def build_parser() -> argparse.ArgumentParser:
                       help="Power cap in watts, e.g. 250")
     sp = sub.add_parser("probe-poll")
     sp.add_argument("--seconds", type=int, default=30)
+    dr = sub.add_parser("doctor")
+    dr.add_argument("--json", action="store_true", dest="json_out",
+                     help="emit machine-readable JSON (schema_version=1)")
+    dr.add_argument("--bundle", metavar="PATH",
+                     help="write a redacted support bundle (tar.gz) to PATH")
+    dr.add_argument("--bundle-preview", action="store_true",
+                     help="list what --bundle would write, without writing it")
     return p
 
 
@@ -1784,6 +2024,12 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_set_tuning(conf, args.offset_mv, args.cap_w)
     if args.cmd == "probe-poll":
         return cmd_probe_poll(conf, seconds=args.seconds)
+    if args.cmd == "doctor":
+        if args.bundle_preview:
+            return cmd_doctor_bundle(conf, None, preview=True)
+        if args.bundle:
+            return cmd_doctor_bundle(conf, Path(args.bundle), preview=False)
+        return cmd_doctor(conf, as_json=args.json_out)
     return 2
 
 
