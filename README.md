@@ -23,6 +23,14 @@ No DRM/render-node handles. No LACT on the control path. No fan curve yet.
     r9700-tunerd set-power-cap 250     # validated against the live or cached cap range
     r9700-tunerd probe-poll
 
+## Features
+
+The eviction guard (EVICT_GUARD=1, enabled by default) monitors GPU VRAM usage and
+prevents the R9700 from entering D3cold when VRAM contents would overflow the Graphics
+Translation Table during eviction. This avoids system freezes when large GPU workloads
+such as LLM inference occupy more VRAM than GTT can absorb. The guard automatically
+releases when VRAM usage drops to safe levels.
+
 ## Rollback
 
     sudo systemctl disable --now r9700-tunerd.service

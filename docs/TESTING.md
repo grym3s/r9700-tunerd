@@ -104,3 +104,42 @@ Start the server as a transient user unit so it survives the shell:
 
     systemd-run --user --unit r9700-ui --working-directory=$HOME/src/r9700-tunerd --collect python3 tools/r9700-ui.py
     journalctl --user -u r9700-ui.service | grep TOKEN
+
+## 6. Eviction guard acceptance
+
+Prerequisite: GPU VRAM is available and not in use by another process.
+
+1. Ensure EVICT_GUARD=1 in r9700-tunerd.conf (default).
+2. Start the daemon: `sudo systemctl start r9700-tunerd` (or it is already running).
+3. Load a large GPU model into VRAM (e.g. a 17.7 GB model in LM Studio).
+4. Check daemon logs: `journalctl -u r9700-tunerd -n 20` should show "evict-guard: holding
+   dGPU awake — VRAM X.XG > 90% of GTT X.XG" with VRAM and GTT numbers.
+5. Check power/control: query the PCI device path via `r9700-tunerd discover`, extract the
+   PCI device path from the output, and then read the control sysfs file at that path; it
+   should show "on" (held by eviction guard).
+6. Verify daemon status: `r9700-tunerd status` should show `runtime_status=active` (GPU
+   held awake by the guard).
+7. Unload the model from VRAM.
+8. Check daemon logs: should see "evict-guard: released hold — VRAM X.XG < 72% of
+   GTT X.XG" (80% of 90% = 72%).
+9. Wait a few seconds and re-check: `r9700-tunerd status` should show `runtime_status=suspended`
+   (GPU back to sleep).
+10. Check power/control again: should return to "auto" (runtime PM re-enabled).
+11. Stop daemon and verify hold is released:
+
+    sudo systemctl stop r9700-tunerd
+    
+    Check daemon logs: should see "evict-guard: released hold on shutdown".
+    Query the PCI device path via `r9700-tunerd discover`, extract the PCI device path,
+    and read power/control: should show "auto" (hold released).
+
+12. Crash path test (unclean daemon death):
+
+    Prerequisite: GPU VRAM is available and a large model is loaded (to trigger the hold).
+    
+    1. Load a large GPU model again.
+    2. Verify the hold is active: `r9700-tunerd status` shows `holding`, power/control shows "on".
+    3. Kill the daemon process uncleanly (SIGKILL): `sudo killall -9 r9700-tunerd`.
+    4. Systemd's ExecStopPost runs `release-hold` automatically, releasing the hold.
+    5. Check daemon logs: should see "evict-guard: released stale hold" from the release-hold call.
+    6. Query power/control again: should show "auto" (ExecStopPost guaranteed the release).
