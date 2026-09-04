@@ -42,3 +42,7 @@ No DRM/render-node handles. No LACT on the control path. No fan curve yet.
 ## Docs
 
 docs/ARCHITECTURE.md · docs/AMDGPU-R9700-NOTES.md · docs/TESTING.md · docs/ACCEPTANCE-2026-09-04.md · docs/UI.md · docs/ROADMAP.md
+
+## License
+
+MIT. See [LICENSE](LICENSE).
