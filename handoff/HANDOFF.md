@@ -208,7 +208,33 @@ What to do next if the loop is ever seen again (cheapest first):
 4. Only after step 1 is clean should the app be considered released; until
    then the browser dashboard is the safe path.
 
-### 5b. Second open issue: GTK main thread stuck in a futex wait (seen twice)
+#### 5a. RESOLVED (15:10): the wake loops were desktop monitors, not the app
+
+- **Mission Center** (`io.missioncenter.MissionCenter`, GPU page enabled,
+  update interval setting 20) opens the R9700's render node and polls it.
+  While its window is active it holds the card awake continuously (measured
+  15:04:40 onward: card active, `missioncenter-m` is the only non-compositor
+  holder of `renderD128`). It launched at 13:44:15 in boot -2, eleven
+  seconds before the R9700 resume that never completed (the freeze in §5d):
+  it was the process that opened the card into the 15.5 GB GTT trap. It
+  was launched again at 13:57, 14:26 and 15:04. The 14:45–15:00 loop of 72
+  wakes at 13 s happened with it running in the background.
+- **Omarchy display/brightness panel** (`plugins/panels/monitor`,
+  refreshes every 5 s via `omarchy-monitor-state` → `hyprctl monitors all`
+  + `brightnessctl -d <monitor>`) was open during both loop windows
+  (10:03–10:09 and 14:44–15:00). Direct test: `hyprctl monitors all -j`
+  does NOT wake the card. `brightnessctl` appeared to, but Mission Center
+  launched in the same second, so that result is contaminated; retest with
+  Mission Center closed before blaming the panel.
+- The tuner app is cleared: at 10:06 the panel was open, at 14:45 Mission
+  Center was running, and the app was not involved in either.
+
+Rule for the owner: any GPU monitor (Mission Center, btop with GPU, nvtop,
+amdgpu_top, LACT) that is pointed at the R9700 defeats runtime PM for as
+long as it runs; the tuner's own dashboard is the only monitor built not
+to. Closing Mission Center lets the card sleep again within 5 s.
+
+## 5b. Second open issue: GTK main thread stuck in a futex wait (seen twice)
 
 Two app instances ended with the main thread in `futex_do_wait` (19 threads,
 no GLib poll): one launched from the orchestrator's sandboxed shell (never
