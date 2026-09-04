@@ -1,0 +1,38 @@
+{
+  "preset": "",
+  "operation": {
+    "fields": []
+  },
+  "load": {
+    "fields": [
+      {
+        "key": "llm.load.numParallelSessions",
+        "value": 1
+      },
+      {
+        "key": "llm.load.llama.speculativeDecoding.draftMaxTokens",
+        "value": 4
+      },
+      {
+        "key": "llm.load.contextLength",
+        "value": 131072
+      },
+      {
+        "key": "llm.load.llama.speculativeDecoding.draftDflashSidecar",
+        "value": true
+      },
+      {
+        "key": "llm.load.llama.speculativeDecoding.draftModel",
+        "value": "incoai/Qwen3.8-27B-DFlash2-GGUF/Qwen3.8-27B-DFlash2-Q4_K_M.gguf"
+      },
+      {
+        "key": "llm.load.llama.speculativeDecoding.draftMtp",
+        "value": false
+      },
+      {
+        "key": "llm.load.llama.speculativeDecoding.draftSimple",
+        "value": false
+      }
+    ]
+  }
+}

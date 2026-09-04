@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=R9700 Tuner
+Comment=GPU tuning dashboard for ASUS Radeon AI PRO R9700 (RDNA4)
+Exec=r9700-tuner
+Icon=r9700-tuner
+Terminal=false
+Type=Application
+Categories=System;Settings;HardwareSettings;
+StartupWMClass=r9700-tuner

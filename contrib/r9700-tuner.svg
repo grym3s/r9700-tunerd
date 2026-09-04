@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <!-- GPU card body -->
+  <rect x="6" y="18" width="52" height="28" rx="4" fill="#2d2d3f"/>
+  <!-- PCIe connector -->
+  <rect x="6" y="46" width="36" height="4" rx="1" fill="#4a4a5e"/>
+  <!-- Fan circle -->
+  <circle cx="24" cy="32" r="9" fill="#4a4a5e"/>
+  <circle cx="24" cy="32" r="3" fill="#2d2d3f"/>
+  <!-- Fan blades (simplified) -->
+  <path d="M24 23 Q30 28 24 32 Q18 28 24 23Z" fill="#2d2d3f"/>
+  <path d="M33 32 Q28 38 24 32 Q28 26 33 32Z" fill="#2d2d3f"/>
+  <path d="M24 41 Q18 36 24 32 Q30 36 24 41Z" fill="#2d2d3f"/>
+  <path d="M15 32 Q20 26 24 32 Q20 38 15 32Z" fill="#2d2d3f"/>
+  <!-- Lightning bolt -->
+  <path d="M44 22 L40 32 L46 32 L42 42 L50 30 L44 30 L48 22Z" fill="#f0c040"/>
+</svg>
