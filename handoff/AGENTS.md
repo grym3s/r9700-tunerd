@@ -9,7 +9,7 @@ Global config: `~/.hermes/config.yaml`. Secrets: `~/.hermes/.env` and
 
 | Profile | Role | Model | Where it runs | Cost |
 |---|---|---|---|---|
-| **forge** | Lead engineer: architecture, task decomposition, code review, acceptance, unblocking builders. Does not build. | `anthropic/claude-opus-5` | OpenRouter (`https://openrouter.ai/api/v1`) | cloud, expensive, **no key present** |
+| **forge** | Lead engineer: architecture, task decomposition, code review, acceptance, unblocking builders. Does not build. | `claude-opus-4-6` | Anthropic API via the owner's Claude Pro/Max OAuth (`hermes auth add anthropic --type oauth`, done 2026-09-04) | cloud, subscription |
 | **ray** | Engineer/developer. Default assignee for all building: implementation, unit tests, bug fixes, refactors, scripts, docs. | `qwen/qwen3.8-27b@q4_k_m` (Qwen3.8-27B Q4_K_M + DFlash2 drafter) | LM Studio headless on the R9700, `http://127.0.0.1:1234/v1` | free |
 | **vale** | UI/UX designer: layout, flows, UX copy, accessibility, UI contract. Hands implementation to Ray/Halo. | `anthropic/claude-fable-5.1` | OpenRouter | cloud, expensive, **no key present** |
 | **halo** | Senior engineer, second builder: harder/larger implementation, debugging, integration, adversarial review. Runs in parallel with Ray. | `qwen3.8-27b-q6` (Qwen3.8-27B Q6_K + DFlash2 drafter) | llama.cpp b10784 Vulkan on the Strix Halo iGPU, `http://127.0.0.1:1235/v1` | free |
@@ -24,9 +24,9 @@ Hermes's own routing respects it.
 `~/.hermes/profiles/forge/config.yaml`
 ```yaml
 model:
-  default: anthropic/claude-opus-5
-  provider: auto
-  base_url: https://openrouter.ai/api/v1
+  default: claude-opus-4-6
+  provider: anthropic
+  base_url: https://api.anthropic.com
 ```
 `~/.hermes/profiles/ray/config.yaml`
 ```yaml
@@ -210,3 +210,14 @@ OUT=out.md MAXTOK=16000 python3 handoff/tools/ask_qwen.py B task.md file1.py    
   used as the fallback for a cloud review. Wi-Fi drops on this machine were
   local 2.4 GHz RF congestion (not the mt7925e driver, not the ISP); wired
   `enp196s0` or 5 GHz is the fix.
+
+
+## Kanban board for the tuner (created 2026-09-04)
+
+Board `r9700-tunerd` (project `r9700-tunerd`, primary repo `~/src/r9700-tunerd`).
+Cards use `--workspace worktree:/home/grymes/src/r9700-tunerd --branch wt/<name>`;
+worktrees appear under `~/src/r9700-tunerd/.worktrees/<task-id>`. The running
+Hermes gateway dispatches cards; `hermes kanban daemon` refuses to run beside
+it. `hermes kanban --board r9700-tunerd list|show <id>` to follow progress.
+**Standing rule from the owner: every agent task goes through a kanban card,
+never a direct API call.**
