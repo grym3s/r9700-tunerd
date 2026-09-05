@@ -2517,6 +2517,16 @@ def cmd_release_hold(conf: dict) -> int:
             "evict-guard: no hold to release "
             f"(control={current}, state={state_data.get('state', 'unknown')})"
         )
+    # Fan curve: release manual PWM if the card is active.
+    # Same contract as the eviction guard release: best-effort,
+    # never raises, only writes when there is something to release.
+    if is_active(pci):
+        try:
+            if read_fan_mode(pci) == 1:
+                release_fan_to_firmware(pci)
+                log("fan curve: released stale manual PWM (ExecStopPost)")
+        except Exception as e:
+            log(f"fan curve: ExecStopPost release failed: {e}", syslog.LOG_WARNING)
     return 0
 
 

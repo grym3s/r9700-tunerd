@@ -534,3 +534,20 @@ def test_hazard_reset_releases_fan_to_firmware(fake_tree, conf, monkeypatch):
 
     assert result == 0
     assert hwmon.joinpath("pwm1_enable").read_text().strip() == "2"
+
+
+def test_hazard_release_hold_releases_stale_manual_pwm(fake_tree, conf, monkeypatch):
+    """HAZARD: ExecStopPost (release-hold) must also release fan control.
+
+    After SIGKILL with the restart budget exhausted, ExecStopPost is the
+    last chance to hand fan control back to firmware. If the card is
+    active and pwm1_enable was left at 1 (manual), release-hold must
+    restore firmware control (pwm1_enable=2), not just the eviction
+    guard's power/control.
+    """
+    hwmon = _add_fan_sysfs(fake_tree, temp_c=75.0, pwm1_enable="1", pwm1="120")
+
+    result = rt.cmd_release_hold(conf)
+
+    assert result == 0
+    assert hwmon.joinpath("pwm1_enable").read_text().strip() == "2"
