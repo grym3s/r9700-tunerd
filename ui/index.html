@@ -143,6 +143,30 @@ pre.log{margin:0;font-family:var(--mono);font-size:12px;color:#b9c4cf;background
     </div>
 
     <div class="card full">
+      <h2>Named profile <span class="muted" id="npState"></span></h2>
+      <div class="btns" id="npButtons"></div>
+      <div class="muted" style="margin-top:8px;font-size:12px">Sourced from the daemon's <code>list-profiles --json</code>; clicking a button calls <code>set-profile</code> through the mutation-locked API path. Hover a button for the measurement it traces to.</div>
+    </div>
+
+    <div class="card full">
+      <h2>Fan curve <span class="muted" id="fanState"></span></h2>
+      <canvas id="fanCanvas" style="height:160px"></canvas>
+      <table id="fanPoints" style="margin-top:10px"><thead><tr><th>temp °C</th><th>pwm %</th><th></th></tr></thead><tbody></tbody></table>
+      <div class="btns">
+        <button id="fanAddBtn">Add point</button>
+        <button class="primary" id="fanApplyBtn">Apply curve</button>
+        <button class="danger" id="fanOffBtn" title="Disable the curve and hand fan control back to firmware">Firmware control</button>
+      </div>
+      <div class="muted" id="fanErr" style="margin-top:8px;font-size:12px;color:var(--bad)"></div>
+      <div class="muted" style="margin-top:4px;font-size:12px">Points must be 2+, strictly increasing temp (0..110 °C), non-decreasing pwm (0..100%). Validated here AND independently re-validated by the daemon. While the card sleeps this view is read-only (no live reads) and the current pwm/rpm point is not shown.</div>
+    </div>
+
+    <div class="card full">
+      <h2>Matrix results <span class="muted" id="matrixState"></span></h2>
+      <table id="matrixTable"><thead><tr></tr></thead><tbody></tbody></table>
+    </div>
+
+    <div class="card full">
       <h2>Benchmarks <span class="muted" id="benchstate"></span></h2>
       <table id="bench"><thead><tr>
         <th>label</th><th>offset</th><th>cap</th><th>gen tok/s</th><th>agg tok/s</th><th>mean W</th><th>tok/s/W</th><th>max Tj</th><th>stable</th><th>err</th><th>D3cold s</th><th>when</th>
@@ -268,6 +292,7 @@ pre.log{margin:0;font-family:var(--mono);font-size:12px;color:#b9c4cf;background
     while (hist.length > MAXH || (hist.length > 1 && hist[0].t < Date.now() - (WINDOW_S+5)*1000)) hist.shift(); draw();
     if (s.recent_journal) $('journal').textContent = s.recent_journal.join ? s.recent_journal.join('\n') : s.recent_journal;
     markProfile();
+    if (typeof fanApplyServerState === 'function') fanApplyServerState(s);
   }
 
   // ---- sliders ----
@@ -338,6 +363,151 @@ pre.log{margin:0;font-family:var(--mono);font-size:12px;color:#b9c4cf;background
   refreshStatus().then(() => { if (tuned) { $('voSlider').value = tuned.offset_mv; $('capSlider').value = tuned.cap_w; syncOut(); } });
   loadProfiles(); loadBench(); pollBench(); connectSSE();
   setInterval(() => api('/api/status').then(s => { if (s.recent_journal) $('journal').textContent = s.recent_journal.join('\n'); }).catch(()=>{}), 10000);
+
+  // ---- named profiles (EFFICIENCY / BALANCED / PERFORMANCE) ----
+  async function loadNamedProfiles(){
+    try {
+      const data = await api('/api/named-profiles');
+      const box = $('npButtons'); box.innerHTML = '';
+      (data.profiles||[]).forEach(p => {
+        const b = document.createElement('button');
+        b.textContent = p.name + (p.active ? ' ●' : '');
+        if (p.active) b.className = 'primary';
+        b.title = p.source || '';
+        b.onclick = async () => {
+          try { await post('/api/set-profile', {name: p.name}, 'Profile ' + p.name); loadNamedProfiles(); }
+          catch(e){}
+        };
+        box.appendChild(b);
+      });
+      $('npState').textContent = data.active ? ('· active: ' + data.active) : '';
+    } catch(e){ $('npState').textContent = 'unavailable: ' + e.message; }
+  }
+  loadNamedProfiles();
+
+  // ---- fan curve editor ----
+  let fanPoints = [];   // [[temp, pwm], ...] — the editable draft
+  let fanLoadedOnce = false;
+  function fanValidate(points){
+    if (!Array.isArray(points) || points.length < 2) return 'at least two points are required';
+    for (const p of points) {
+      if (!Array.isArray(p) || p.length !== 2 || !Number.isFinite(p[0]) || !Number.isFinite(p[1])) return 'each point must be [temp, pwm]';
+      if (p[0] < 0 || p[0] > 110) return `temp ${p[0]} out of range 0..110`;
+      if (p[1] < 0 || p[1] > 100) return `pwm ${p[1]} out of range 0..100`;
+    }
+    const sorted = [...points].sort((a,b)=>a[0]-b[0]);
+    const temps = sorted.map(p=>p[0]);
+    if (new Set(temps).size !== temps.length) return 'duplicate temperature points';
+    for (let i=1;i<sorted.length;i++){
+      if (sorted[i][0] <= sorted[i-1][0]) return 'temp points must be strictly increasing';
+      if (sorted[i][1] < sorted[i-1][1]) return 'pwm points must be monotonically non-decreasing with temp';
+    }
+    return null;
+  }
+  function fanRenderTable(){
+    const tb = $('fanPoints').querySelector('tbody'); tb.innerHTML = '';
+    fanPoints.forEach((p, i) => {
+      const tr = document.createElement('tr');
+      const tdT = document.createElement('td'); const tdP = document.createElement('td'); const tdX = document.createElement('td');
+      const it = document.createElement('input'); it.type='number'; it.min=0; it.max=110; it.step=1; it.value=p[0]; it.style.width='80px';
+      const ip = document.createElement('input'); ip.type='number'; ip.min=0; ip.max=100; ip.step=1; ip.value=p[1]; ip.style.width='80px';
+      it.addEventListener('input', () => { fanPoints[i][0] = Number(it.value); fanRenderCanvas(); });
+      ip.addEventListener('input', () => { fanPoints[i][1] = Number(ip.value); fanRenderCanvas(); });
+      tdT.appendChild(it); tdP.appendChild(ip);
+      const rm = document.createElement('button'); rm.textContent = '✕'; rm.title = 'Remove point';
+      rm.onclick = () => { fanPoints.splice(i,1); fanRenderTable(); fanRenderCanvas(); };
+      tdX.appendChild(rm);
+      tr.appendChild(tdT); tr.appendChild(tdP); tr.appendChild(tdX);
+      tb.appendChild(tr);
+    });
+  }
+  const fanCanvas = $('fanCanvas'); const fanCtx = fanCanvas.getContext('2d');
+  let fanLive = null; // {pwm_pct, live: bool}
+  function fanFitCanvas(){ const dpr = window.devicePixelRatio||1; const w = fanCanvas.clientWidth||1200, h = fanCanvas.clientHeight||160;
+    if (fanCanvas.width !== Math.round(w*dpr) || fanCanvas.height !== Math.round(h*dpr)) { fanCanvas.width = Math.round(w*dpr); fanCanvas.height = Math.round(h*dpr); } }
+  window.addEventListener('resize', fanRenderCanvas);
+  function fanRenderCanvas(){
+    fanFitCanvas();
+    const dpr = window.devicePixelRatio||1; const W = fanCanvas.width, H = fanCanvas.height;
+    fanCtx.clearRect(0,0,W,H); fanCtx.fillStyle = '#0a0d11'; fanCtx.fillRect(0,0,W,H);
+    fanCtx.strokeStyle = '#1c232c'; fanCtx.lineWidth = 1;
+    for (let y=0;y<=4;y++){ fanCtx.beginPath(); fanCtx.moveTo(0,y*H/4); fanCtx.lineTo(W,y*H/4); fanCtx.stroke(); }
+    const asleep = fanLive && fanLive.asleep;
+    const xOf = t => (t/110)*W, yOf = p => H - (p/100)*H*0.9 - 6*dpr;
+    const sorted = [...fanPoints].filter(p=>Number.isFinite(p[0])&&Number.isFinite(p[1])).sort((a,b)=>a[0]-b[0]);
+    if (sorted.length) {
+      fanCtx.strokeStyle = asleep ? '#4a5563' : '#ff5c1a'; fanCtx.lineWidth = 2*dpr; fanCtx.beginPath();
+      sorted.forEach((p,i) => { const x=xOf(p[0]), y=yOf(p[1]); if (i===0) fanCtx.moveTo(x,y); else fanCtx.lineTo(x,y); });
+      fanCtx.stroke();
+      fanCtx.fillStyle = asleep ? '#4a5563' : '#ffb02e';
+      sorted.forEach(p => { fanCtx.beginPath(); fanCtx.arc(xOf(p[0]), yOf(p[1]), 3*dpr, 0, 7); fanCtx.fill(); });
+    }
+    if (fanLive && !asleep && fanLive.pwm_pct != null) {
+      fanCtx.fillStyle = '#5aa9ff';
+      fanCtx.beginPath(); fanCtx.arc(W-8*dpr, yOf(fanLive.pwm_pct), 4*dpr, 0, 7); fanCtx.fill();
+      fanCtx.font = `${12*dpr}px ui-monospace,monospace`; fanCtx.fillText('live '+fanLive.pwm_pct.toFixed(0)+'%', 12*dpr, 16*dpr);
+    }
+    if (asleep) { fanCtx.fillStyle = '#4a5563'; fanCtx.font = `${13*dpr}px ui-monospace,monospace`; fanCtx.fillText('card asleep — showing configured curve only, no live reads', 12*dpr, H-10*dpr); }
+    fanCtx.fillStyle = '#8a96a3'; fanCtx.font = `${11*dpr}px ui-monospace,monospace`; fanCtx.fillText('0–110 °C / 0–100 % pwm', W-160*dpr, H-8*dpr);
+  }
+  function fanApplyServerState(s){
+    const fan = s.fan || {};
+    const active = s.runtime_status === 'active';
+    if (!fanLoadedOnce || document.activeElement === document.body) {
+      if (!fanEditing) { fanPoints = (fan.points || []).map(p => [p[0], p[1]]); fanRenderTable(); }
+    }
+    fanLoadedOnce = true;
+    fanLive = active && fan.pwm_pct != null ? {pwm_pct: fan.pwm_pct, asleep:false} : {asleep: !active};
+    $('fanState').textContent = (fan.enabled ? '· enabled' : '· firmware control')
+      + (active ? (fan.mode ? ` · mode=${fan.mode}` : '') + (fan.rpm!=null ? ` · ${fan.rpm} rpm` : '')
+                : ' · card asleep — no live reads');
+    fanRenderCanvas();
+  }
+  let fanEditing = false;
+  $('fanAddBtn').onclick = () => { fanEditing = true; fanPoints.push([50, 50]); fanRenderTable(); fanRenderCanvas(); };
+  $('fanApplyBtn').onclick = async () => {
+    const err = fanValidate(fanPoints);
+    $('fanErr').textContent = err || '';
+    if (err) return;
+    try {
+      await post('/api/set-fan-curve', {points: fanPoints.map(p=>[Number(p[0]),Number(p[1])])}, 'Fan curve');
+      fanEditing = false;
+    } catch(e){}
+  };
+  $('fanOffBtn').onclick = () => { if (confirm('Disable the fan curve and hand control back to firmware?')) post('/api/set-fan-curve', {off:true}, 'Fan → firmware'); };
+  fanRenderCanvas();
+
+  // ---- matrix results (read-only) ----
+  let matrixRows = []; let matrixSort = {col:null, dir:1};
+  const MATRIX_COLS = [
+    ['offset_mv','offset mV'], ['cap_w','cap W'], ['gen_tok_s','tok/s'],
+    ['tok_s_per_w','tok/s/W'], ['verdict','verdict'], ['source','source'],
+  ];
+  function matrixRenderTable(){
+    const table = $('matrixTable'); const thead = table.querySelector('thead tr'); thead.innerHTML='';
+    MATRIX_COLS.forEach(([key,label]) => {
+      const th = document.createElement('th'); th.textContent = label; th.style.cursor='pointer';
+      if (matrixSort.col===key) th.textContent += matrixSort.dir>0 ? ' ▲' : ' ▼';
+      th.onclick = () => { matrixSort = {col:key, dir: matrixSort.col===key ? -matrixSort.dir : 1}; matrixRenderTable(); };
+      thead.appendChild(th);
+    });
+    const rows = [...matrixRows];
+    if (matrixSort.col) rows.sort((a,b) => {
+      const av=a[matrixSort.col], bv=b[matrixSort.col];
+      if (av==null && bv==null) return 0; if (av==null) return 1; if (bv==null) return -1;
+      return av>bv ? matrixSort.dir : av<bv ? -matrixSort.dir : 0;
+    });
+    const tb = table.querySelector('tbody'); tb.innerHTML='';
+    rows.forEach(r => { const tr=document.createElement('tr');
+      tr.innerHTML = MATRIX_COLS.map(([k])=>`<td>${r[k]==null?'—':r[k]}</td>`).join('');
+      tb.appendChild(tr); });
+    if (!rows.length) tb.innerHTML = `<tr><td colspan="${MATRIX_COLS.length}" class="muted">no matrix results found</td></tr>`;
+  }
+  async function loadMatrix(){
+    try { matrixRows = await api('/api/matrix'); $('matrixState').textContent = `· ${matrixRows.length} rows (read-only)`; matrixRenderTable(); }
+    catch(e){ $('matrixState').textContent = 'unavailable: ' + e.message; }
+  }
+  loadMatrix();
 })();
 </script>
 </body>

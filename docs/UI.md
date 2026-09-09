@@ -27,6 +27,21 @@ binds 127.0.0.1 only and refuses `0.0.0.0` without `--insecure-lan`.
   `set-undervolt` then `set-power-cap`; the daemon re-validates.
 - Profiles: Stock, Efficiency (measured), Balanced and Performance (placeholders
   until Phase 4 measures them). Clicking loads the sliders; Apply commits.
+- Named profile (EFFICIENCY / BALANCED / PERFORMANCE): sourced live from the
+  daemon's `list-profiles --json`, never hardcoded. Clicking a button calls
+  `set-profile` through the token-gated, mutation-locked `/api/set-profile`
+  route; each button's tooltip shows the profile's measurement citation.
+- Fan curve editor: an editable point list (temp °C / pwm %) with add/remove
+  and keyboard-usable numeric inputs, submitted through `/api/set-fan-curve`.
+  Client-side validation mirrors the daemon's rules (2+ points, monotonic,
+  in-range) so a bad curve never leaves the browser, but the daemon
+  independently re-validates — the client is never trusted alone. While the
+  card is active the current pwm/rpm point is drawn live on the curve; while
+  suspended the curve renders greyed with "card asleep" and the view makes
+  zero live reads.
+- Matrix results: a read-only table parsed server-side from
+  `docs/MATRIX-2026-09-04.md` and `docs/results/*`, sortable by any column
+  (offset, cap, tok/s, tok/s/W, pass/fail). No rerun button.
 - Benchmarks: every result under `~/r9700-bench` (superseded runs excluded),
   best tok/s/W highlighted, and a button that runs the harness at the current
   slider setting and streams its output.

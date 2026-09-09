@@ -79,6 +79,8 @@ def fake_ui_tree(tmp_path, monkeypatch):
     (hwmon / "temp2_input").write_text("60000\n")
     (hwmon / "temp3_input").write_text("45000\n")
     (hwmon / "fan1_input").write_text("1200\n")
+    (hwmon / "pwm1").write_text("128\n")
+    (hwmon / "pwm1_enable").write_text("1\n")
 
     # --- Config file ------------------------------------------------------
     conf_path = tmp_path / "r9700-tunerd.conf"
@@ -541,6 +543,8 @@ class TestAuthGetRoutes:
         "/api/bench",
         "/api/bench/status",
         "/api/profiles",
+        "/api/named-profiles",
+        "/api/matrix",
         "/api/unknown",
     ])
     def test_get_no_token_403(self, server, path):
@@ -553,6 +557,8 @@ class TestAuthGetRoutes:
         "/api/bench",
         "/api/bench/status",
         "/api/profiles",
+        "/api/named-profiles",
+        "/api/matrix",
     ])
     def test_get_wrong_token_403(self, server, path):
         code, body = _get(server, path, token="wrong-token")
@@ -1163,4 +1169,314 @@ class TestEvictionPills:
         payload = ui_mod._build_status(include_journal=False)
         assert payload["eviction_risk"] is None
         assert payload["held_awake"] is None
+
+
+# ---------------------------------------------------------------------------
+# /api/named-profiles: proxies list-profiles --json from the daemon CLI
+# ---------------------------------------------------------------------------
+
+class TestApiNamedProfiles:
+    def test_proxies_daemon_json(self, server, fake_subprocess, monkeypatch):
+        payload = {
+            "profiles": [
+                {"name": "EFFICIENCY", "offset_mv": -50, "cap_w": 210,
+                 "source": "docs/MATRIX-2026-09-04.md", "active": False},
+                {"name": "BALANCED", "offset_mv": -25, "cap_w": 210,
+                 "source": "docs/MATRIX-2026-09-04.md", "active": True},
+                {"name": "PERFORMANCE", "offset_mv": -50, "cap_w": 210,
+                 "source": "docs/MATRIX-2026-09-04.md", "active": False},
+            ],
+            "active": "BALANCED",
+        }
+        _orig = ui_mod.subprocess.run
+
+        def _wrapped(cmd, **kw):
+            if cmd and cmd[0] == "sudo" and "list-profiles" in cmd:
+                class _CP:
+                    returncode = 0
+                    stdout = json.dumps(payload)
+                    stderr = ""
+                return _CP()
+            return _orig(cmd, **kw)
+
+        monkeypatch.setattr(ui_mod.subprocess, "run", _wrapped)
+
+        code, body = _get(server, "/api/named-profiles", token="test-token-abcdef")
+        assert code == 200
+        assert body["active"] == "BALANCED"
+        names = {p["name"] for p in body["profiles"]}
+        assert names == {"EFFICIENCY", "BALANCED", "PERFORMANCE"}
+
+    def test_daemon_failure_502(self, server, fake_subprocess, monkeypatch):
+        _orig = ui_mod.subprocess.run
+
+        def _wrapped(cmd, **kw):
+            if cmd and cmd[0] == "sudo" and "list-profiles" in cmd:
+                class _CP:
+                    returncode = 1
+                    stdout = ""
+                    stderr = "boom"
+                return _CP()
+            return _orig(cmd, **kw)
+
+        monkeypatch.setattr(ui_mod.subprocess, "run", _wrapped)
+        code, body = _get(server, "/api/named-profiles", token="test-token-abcdef")
+        assert code == 502
+        assert "error" in body
+
+
+# ---------------------------------------------------------------------------
+# /api/set-profile: token-gated, unknown-name rejection, CLI invocation
+# ---------------------------------------------------------------------------
+
+class TestApiSetProfile:
+    def test_valid_name_calls_cli(self, server, fake_subprocess):
+        code, body = _post(server, "/api/set-profile", {"name": "EFFICIENCY"})
+        assert code == 200
+        assert body["ok"] is True
+        sudo_calls = [c for c in fake_subprocess if c["cmd"] and c["cmd"][0] == "sudo"]
+        assert len(sudo_calls) == 1
+        assert sudo_calls[0]["cmd"] == [
+            "sudo", "-n", "/usr/local/sbin/r9700-tunerd", "set-profile", "EFFICIENCY",
+        ]
+
+    def test_lowercase_name_normalized(self, server, fake_subprocess):
+        code, body = _post(server, "/api/set-profile", {"name": "balanced"})
+        assert code == 200
+        sudo_calls = [c for c in fake_subprocess if c["cmd"] and c["cmd"][0] == "sudo"]
+        assert sudo_calls[0]["cmd"][-1] == "BALANCED"
+
+    def test_unknown_name_400_zero_cli(self, server, fake_subprocess):
+        code, body = _post(server, "/api/set-profile", {"name": "BOGUS"})
+        assert code == 400
+        assert "name" in body["error"]
+        assert len(fake_subprocess) == 0
+
+    def test_missing_name_400_zero_cli(self, server, fake_subprocess):
+        code, body = _post(server, "/api/set-profile", {})
+        assert code == 400
+        assert len(fake_subprocess) == 0
+
+    def test_unknown_field_400_zero_cli(self, server, fake_subprocess):
+        code, body = _post(server, "/api/set-profile", {"name": "EFFICIENCY", "bogus": 1})
+        assert code == 400
+        assert len(fake_subprocess) == 0
+
+    def test_nonstring_name_400_zero_cli(self, server, fake_subprocess):
+        code, body = _post(server, "/api/set-profile", {"name": 5})
+        assert code == 400
+        assert len(fake_subprocess) == 0
+
+
+# ---------------------------------------------------------------------------
+# /api/set-fan-curve: token-gated, client-side rule mirror, CLI invocation
+# ---------------------------------------------------------------------------
+
+class TestApiSetFanCurve:
+    def test_valid_curve_calls_cli(self, server, fake_subprocess):
+        code, body = _post(server, "/api/set-fan-curve",
+                            {"points": [[40, 0], [55, 30], [70, 55], [85, 100]]})
+        assert code == 200
+        assert body["ok"] is True
+        sudo_calls = [c for c in fake_subprocess if c["cmd"] and c["cmd"][0] == "sudo"]
+        assert len(sudo_calls) == 1
+        assert sudo_calls[0]["cmd"] == [
+            "sudo", "-n", "/usr/local/sbin/r9700-tunerd",
+            "set-fan-curve", "40:0,55:30,70:55,85:100",
+        ]
+
+    def test_off_calls_cli_with_off_flag(self, server, fake_subprocess):
+        code, body = _post(server, "/api/set-fan-curve", {"off": True})
+        assert code == 200
+        sudo_calls = [c for c in fake_subprocess if c["cmd"] and c["cmd"][0] == "sudo"]
+        assert sudo_calls[0]["cmd"] == [
+            "sudo", "-n", "/usr/local/sbin/r9700-tunerd", "set-fan-curve", "--off",
+        ]
+
+    def test_single_point_400_zero_cli(self, server, fake_subprocess):
+        code, body = _post(server, "/api/set-fan-curve", {"points": [[40, 0]]})
+        assert code == 400
+        assert len(fake_subprocess) == 0
+
+    def test_non_monotonic_pwm_400_zero_cli(self, server, fake_subprocess):
+        code, body = _post(server, "/api/set-fan-curve",
+                            {"points": [[40, 50], [55, 10]]})
+        assert code == 400
+        assert len(fake_subprocess) == 0
+
+    def test_out_of_range_temp_400_zero_cli(self, server, fake_subprocess):
+        code, body = _post(server, "/api/set-fan-curve",
+                            {"points": [[-5, 0], [55, 30]]})
+        assert code == 400
+        assert len(fake_subprocess) == 0
+
+    def test_out_of_range_pwm_400_zero_cli(self, server, fake_subprocess):
+        code, body = _post(server, "/api/set-fan-curve",
+                            {"points": [[40, 0], [55, 150]]})
+        assert code == 400
+        assert len(fake_subprocess) == 0
+
+    def test_duplicate_temp_400_zero_cli(self, server, fake_subprocess):
+        code, body = _post(server, "/api/set-fan-curve",
+                            {"points": [[40, 0], [40, 30]]})
+        assert code == 400
+        assert len(fake_subprocess) == 0
+
+    def test_missing_points_and_off_400_zero_cli(self, server, fake_subprocess):
+        code, body = _post(server, "/api/set-fan-curve", {})
+        assert code == 400
+        assert len(fake_subprocess) == 0
+
+    def test_unknown_field_400_zero_cli(self, server, fake_subprocess):
+        code, body = _post(server, "/api/set-fan-curve",
+                            {"points": [[40, 0], [55, 30]], "bogus": 1})
+        assert code == 400
+        assert len(fake_subprocess) == 0
+
+    def test_non_numeric_point_400_zero_cli(self, server, fake_subprocess):
+        code, body = _post(server, "/api/set-fan-curve",
+                            {"points": [["a", 0], [55, 30]]})
+        assert code == 400
+        assert len(fake_subprocess) == 0
+
+
+# ---------------------------------------------------------------------------
+# /api/status fan block: suspended card never triggers a live hwmon read
+# ---------------------------------------------------------------------------
+
+class TestStatusFanBlock:
+    def test_active_fan_block_from_live(self, server, fake_ui_tree):
+        hwmon = fake_ui_tree / "pci" / "0000:aa:00.0" / "hwmon" / "hwmon7"
+        (hwmon / "pwm1").write_text("128\n")
+        (hwmon / "pwm1_enable").write_text("1\n")
+        (fake_ui_tree / "r9700-tunerd.conf").write_text(
+            "VENDOR=0x1002\nDEVICE=0x7551\n"
+            "SUBSYSTEM_VENDOR=0x1043\nSUBSYSTEM_DEVICE=0x0626\n"
+            "POWER_LIMIT_W=210\nVOLTAGE_OFFSET_MV=-25\n"
+            "FAN_CURVE_ENABLED=1\nFAN_CURVE=40:0,55:30,70:55,85:100\n"
+        )
+        code, body = _get(server, "/api/status", token="test-token-abcdef")
+        assert code == 200
+        fan = body["fan"]
+        assert fan["enabled"] is True
+        assert fan["curve"] == "40:0,55:30,70:55,85:100"
+        assert fan["points"] == [[40, 0], [55, 30], [70, 55], [85, 100]]
+        assert fan["mode"] == "manual"
+        assert fan["pwm_pct"] == pytest.approx(50.2, abs=0.1)
+        assert fan["rpm"] == 1200
+
+    def test_suspended_fan_no_live_read(self, server, fake_ui_tree, monkeypatch):
+        """When suspended, the fan block must show the config curve greyed
+        (mode/pwm/rpm null) and make NO hwmon read."""
+        (fake_ui_tree / "pci" / "0000:aa:00.0" / "power" / "runtime_status").write_text(
+            "suspended\n")
+        (fake_ui_tree / "r9700-tunerd.conf").write_text(
+            "VENDOR=0x1002\nDEVICE=0x7551\n"
+            "SUBSYSTEM_VENDOR=0x1043\nSUBSYSTEM_DEVICE=0x0626\n"
+            "POWER_LIMIT_W=210\nVOLTAGE_OFFSET_MV=-25\n"
+            "FAN_CURVE_ENABLED=1\nFAN_CURVE=40:0,55:30,70:55,85:100\n"
+        )
+
+        def _guard_hwmon(self, name):
+            raise AssertionError(f"read_hwmon({name!r}) called while suspended")
+
+        def _guard_active(self, relpath):
+            raise AssertionError(f"read_active({relpath!r}) called while suspended")
+
+        monkeypatch.setattr(ui_mod.GpuSysfs, "read_hwmon", _guard_hwmon)
+        monkeypatch.setattr(ui_mod.GpuSysfs, "read_active", _guard_active)
+        ui_mod._SAMPLING = ui_mod._SamplingState()
+
+        code, body = _get(server, "/api/status", token="test-token-abcdef")
+        assert code == 200
+        fan = body["fan"]
+        assert fan["enabled"] is True
+        assert fan["curve"] == "40:0,55:30,70:55,85:100"
+        assert fan["mode"] is None
+        assert fan["pwm_pct"] is None
+        assert fan["rpm"] is None
+
+    def test_no_curve_configured(self, server, fake_ui_tree):
+        code, body = _get(server, "/api/status", token="test-token-abcdef")
+        assert code == 200
+        fan = body["fan"]
+        assert fan["enabled"] is False
+        assert fan["curve"] is None
+        assert fan["points"] is None
+
+
+# ---------------------------------------------------------------------------
+# Matrix results: server-side parse of docs/MATRIX-*.md + docs/results/*
+# ---------------------------------------------------------------------------
+
+class TestMatrixResults:
+    def test_parses_markdown_table(self, tmp_path, monkeypatch):
+        doc = tmp_path / "MATRIX-2026-09-04.md"
+        doc.write_text(
+            "# Undervolt characterisation\n\n"
+            "| offset mV | gen tok/s | agg tok/s | mean W | tok/s/W | Tj max °C | errors | D3cold s | verdict |\n"
+            "|---:|---:|---:|---:|---:|---:|---:|---:|---|\n"
+            "| -25  | 37.80 | 37.27 | 204.97 | 0.1818 | 75 | 0 | 20.0 | PASS |\n"
+            "| -50  | 39.62 | 39.07 | 206.89 | 0.1888 | 79 | 0 | 21.0 | PASS |\n"
+        )
+        results_dir = tmp_path / "results"
+        results_dir.mkdir()
+        monkeypatch.setattr(ui_mod, "MATRIX_DOC", doc)
+        monkeypatch.setattr(ui_mod, "RESULTS_DIR", results_dir)
+        monkeypatch.setattr(ui_mod, "REPO_ROOT", tmp_path)
+
+        rows = ui_mod._list_matrix_results()
+        assert len(rows) == 2
+        assert rows[0]["offset_mv"] == -25
+        assert rows[0]["gen_tok_s"] == 37.8
+        assert rows[0]["verdict"] == "PASS"
+        assert rows[1]["offset_mv"] == -50
+        assert all(r["source"] == "MATRIX-2026-09-04.md" for r in rows)
+
+    def test_parses_results_csv(self, tmp_path, monkeypatch):
+        doc = tmp_path / "MATRIX-2026-09-04.md"
+        doc.write_text("# no tables here\n")
+        results_dir = tmp_path / "results"
+        results_dir.mkdir()
+        (results_dir / "matrix-2026-09-04-cap210.csv").write_text(
+            "offset_mv,cap_w,gen_tok_s,agg_tok_s,mean_w,tok_s_per_w,"
+            "max_junction_c,errors,d3cold_s,verdict\r\n"
+            "-25,210,37.8,37.27,204.97,0.1818,75.0,0,20.01,PASS\r\n"
+            "-50,210,39.62,39.07,206.89,0.1888,79.0,0,21.01,PASS\r\n"
+        )
+        monkeypatch.setattr(ui_mod, "MATRIX_DOC", doc)
+        monkeypatch.setattr(ui_mod, "RESULTS_DIR", results_dir)
+        monkeypatch.setattr(ui_mod, "REPO_ROOT", tmp_path)
+
+        rows = ui_mod._list_matrix_results()
+        assert len(rows) == 2
+        assert rows[0]["offset_mv"] == -25
+        assert rows[0]["cap_w"] == 210
+        assert rows[0]["verdict"] == "PASS"
+        assert rows[0]["source"] == "results/matrix-2026-09-04-cap210.csv"
+
+    def test_missing_files_returns_empty(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(ui_mod, "MATRIX_DOC", tmp_path / "nope.md")
+        monkeypatch.setattr(ui_mod, "RESULTS_DIR", tmp_path / "nope")
+        rows = ui_mod._list_matrix_results()
+        assert rows == []
+
+    def test_api_matrix_route_token_gated(self, server):
+        code, body = _get(server, "/api/matrix", token=None)
+        assert code == 403
+
+    def test_api_matrix_route_returns_list(self, server, monkeypatch, tmp_path):
+        doc = tmp_path / "MATRIX-2026-09-04.md"
+        doc.write_text(
+            "| offset mV | gen tok/s | verdict |\n"
+            "|---:|---:|---|\n"
+            "| -25 | 37.80 | PASS |\n"
+        )
+        monkeypatch.setattr(ui_mod, "MATRIX_DOC", doc)
+        monkeypatch.setattr(ui_mod, "RESULTS_DIR", tmp_path / "noresults")
+        code, body = _get(server, "/api/matrix", token="test-token-abcdef")
+        assert code == 200
+        assert isinstance(body, list)
+        assert body[0]["offset_mv"] == -25
+
 

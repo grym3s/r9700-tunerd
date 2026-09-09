@@ -26,8 +26,12 @@ validated on the live card.
    `status --json` and a small local IPC (unix socket) so the UI never touches
    sysfs itself and never holds the card awake; (b) profiles from Phase 4 data.
    Not before Phases 2–4 are accepted.
-6. **Custom fan curve** (delivered pending hardware acceptance; owner request 2026-09-04; see handoff/HANDOFF.md §10 item 6)
+6. **Custom fan curve** (delivered pending hardware acceptance; owner request 2026-09-04; see handoff/HANDOFF.md §10 item 6;
+   DONE 2026-09-04, daemon side: `r9700-tunerd` card R0.2)
    – active-only controller with firmware fallback on every exit path, curve
    editor in the app writing through the daemon CLI. Must pass the dashboard
-   hazard test with the controller enabled.
+   hazard test with the controller enabled. Daemon side (validation,
+   interpolation, hysteresis, `set-fan-curve`, `status --json` fan block,
+   firmware-fallback on every exit path, unit tests) is implemented; the
+   app-side curve editor UI is still open (tracked separately).
 7. **Later** – clock tuning, multi-GPU support beyond the R9700.

@@ -55,6 +55,9 @@ kept the card awake.
 - `watch` – the daemon (below).
 - `reset` – restore `power1_cap_default` and reset the OD table (`r` then `c`).
 - `set-undervolt MV` – write `VOLTAGE_OFFSET_MV` to the config, then `apply`.
+- `set-fan-curve <points>` / `set-fan-curve --off` – validate and atomically write
+  `FAN_CURVE`/`FAN_CURVE_ENABLED`. Never touches sysfs directly; the running
+  watcher picks up the change on its next config reload. See "Custom fan curve" below.
 - `release-hold` – release a stale eviction-guard hold (e.g. left by a crashed daemon).
   Reads power/control and the state file; releases only if both indicate a hold was set.
   Otherwise it is a no-op. Logs the decision and any hold released or reason it was not released.
@@ -161,32 +164,44 @@ offset/cap but flagging that the machine is no longer on a blessed preset. A sub
 `list-profiles` prints the available profiles and their target offsets/caps, allowing a
 user to review all options without touching hardware.
 
-## Fan curve controller
-
-The fan curve (FAN_CURVE_ENABLED, default disabled) is an active-only state machine
-that interpolates firmware PWM duty from a temperature curve only while the GPU is
-`runtime_status=active`. The curve is defined by temperature/PWM points in the config
-(e.g. `FAN_POINT_1=55:30` means 30% PWM at 55°C); linear interpolation between points
-and clamping at the edges handles in-between temperatures. When the GPU enters D3cold
-(power/runtime_status changes from active to suspended), the controller writes \"0\"
-to the firmware control sysfs file, releasing manual control back to firmware auto mode
-(the fallback), which spins the fans down to 0 RPM.
-
-The controller has one entry point (the `set-fan-curve` command, which parses and
-validates the new curve against sysfs limits, updates config, then applies atomically
-via a read-before-write guard), and many exit paths that must restore the fallback:
-normal daemon `watch` loop transitions to suspended, daemon SIGTERM/SIGINT on exit,
-unclean daemon death (SIGKILL), driver rebind, GPU reset, and any system crash. To
-survive all exit paths, the `r9700-tunerd.service` unit has `ExecStopPost=r9700-tunerd
-fan-release`, which runs even on SIGKILL and writes the fallback-enable value to
-firmware control.
-
-**Safety rationale:** a stuck manual curve that prevents the firmware from spinning
-the fans down will cause thermal runaway on idle workloads or notebook mode. The
-firmware fallback is the only safe default; the daemon releases it on every exit
-path without exception. Hysteresis (FAN_HYSTERESIS_C, default 2°C) prevents flapping
-when temperature oscillates near a curve point.
-
 ## Out of scope for now
 
-Clock offsets, benchmarking, additional thermal sensors. See docs/ROADMAP.md.
+Clock offsets, profiles, benchmarking, multi-GPU support. See docs/ROADMAP.md.
+Fan control (see "Custom fan curve" below) is implemented as of R0.2 but
+remains a high-risk surface: keep the safety contract in mind before
+touching it.
+
+## Custom fan curve (R0.2)
+
+`FAN_CURVE_ENABLED=1` plus a validated `FAN_CURVE=temp:pwm,...` point list
+turns on an active-only linear-interpolation fan controller, polled from
+inside the existing `cmd_watch` loop tick (no new timer). Safety contract:
+
+1. **Active-only.** `fan_controller_poll()` is only ever called from the
+   watch loop's `st == "active"` branch. When the card reports suspended,
+   the controller's in-process state is cleared via
+   `fan_release_if_manual(None)` (pci=None: no sysfs write, because writing
+   `pwm1_enable` while suspended is exactly the class of access the hard
+   rules forbid — it can wake or hang the device the same way a read can).
+   A stale `pwm1_enable=1` left by a prior instance is instead cleaned up
+   by the startup orphan check the next time the daemon starts while active.
+2. **Firmware fallback on every exit path.** `cmd_watch`'s main loop is
+   wrapped in `try/finally`; the `finally` releases to firmware
+   (`pwm1_enable=2`) if the in-process controller is in "manual" mode and
+   the card is active. This covers clean stop, SIGTERM/SIGINT (the signal
+   handler only sets a flag; the `finally` still runs), and any unhandled
+   exception that escapes the per-iteration try. `reset` also calls
+   `release_fan_to_firmware()` unconditionally (best-effort, never raises)
+   as a second mandated exit path. `set-fan-curve` never touches sysfs
+   itself — it only validates and atomically writes config; the running
+   watcher picks up the change on its next reload.
+3. **Hysteresis on the way down only** (`fan_target_pwm`, pure function,
+   no sysfs): a rising temperature always tracks the curve immediately; a
+   falling temperature only drops the fan once it falls `FAN_HYSTERESIS_C`
+   below the peak that raised it. Prevents flapping on small oscillations.
+4. **Interpolation** (`fan_curve_interpolate`) is a pure, clamped linear
+   function with no sysfs access — trivially unit-tested in isolation.
+5. **Config validation is non-fatal.** An invalid `FAN_CURVE` (or
+   `FAN_CURVE_ENABLED=1` with no usable points) is reported like an
+   "unknown key" — the daemon still starts and runs on firmware fan
+   control; it never aborts.

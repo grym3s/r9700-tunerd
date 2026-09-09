@@ -64,6 +64,22 @@ class _EvictGuardState:
 
 _evict = _EvictGuardState()
 
+
+class _FanState:
+    """Module-level runtime state for the custom fan curve controller.
+
+    This is the daemon PROCESS's private in-memory state. `status`/`doctor`
+    run as their own process and must never read it (see the docstring on
+    _evict_guard_state for the same rule applied to the eviction guard);
+    they derive the live fan mode from sysfs instead.
+    """
+    mode = "firmware"      # "firmware" or "manual"
+    last_pwm = None        # last written PWM percent (0..100), None if firmware
+    peak_temp = None       # highest temp_c since the last hysteresis-gated drop
+
+
+_fan = _FanState()
+
 # Set the first time write_state() fails, so the warning is logged once
 # (not per poll) instead of silently swallowing every OSError forever.
 _state_write_warned = False
@@ -80,9 +96,60 @@ DEFAULTS = {
     "POLL_INTERVAL_S": "2",
     "EVICT_GUARD": "1",
     "EVICT_GUARD_MARGIN": "0.90",
+    "PROFILE": "",
+    "FAN_CURVE": "",
+    "FAN_CURVE_ENABLED": "0",
+    "FAN_HYSTERESIS_C": "3",
 }
 
 KNOWN_KEYS = frozenset(DEFAULTS.keys())
+
+# Named tuning profiles derived from the measured undervolt/power-cap
+# matrix (docs/MATRIX-2026-09-04.md, run at a fixed 210 W cap; -25/-50/-75/
+# -100 mV all PASS, the whole measured gain is at -50 mV, flat beyond).
+# Every value here traces to that document; nothing is invented. Only one
+# power cap has been characterised so far, so EFFICIENCY and PERFORMANCE
+# currently resolve to the same measured point (see each "source" string).
+PROFILE_NAMES = ("EFFICIENCY", "BALANCED", "PERFORMANCE")
+
+PROFILES: dict[str, dict] = {
+    "EFFICIENCY": {
+        "offset_mv": -50,
+        "cap_w": 210,
+        "source": (
+            "docs/MATRIX-2026-09-04.md (2026-09-04): -50 mV/210 W is the "
+            "best measured tokens/s/W (0.1888) of the four tested offsets "
+            "and captures the entire measured throughput gain (+4.8% gen "
+            "tok/s vs -25 mV) at the same power."
+        ),
+    },
+    "BALANCED": {
+        "offset_mv": -25,
+        "cap_w": 210,
+        "source": (
+            "docs/MATRIX-2026-09-04.md (2026-09-04): -25 mV/210 W is the "
+            "safe point the daemon was restored to after the "
+            "characterisation run. -50 mV is recommended for daily use but "
+            "not yet owner-adopted as the default, so BALANCED stays at "
+            "the currently adopted safe value rather than the "
+            "recommendation."
+        ),
+    },
+    "PERFORMANCE": {
+        "offset_mv": -50,
+        "cap_w": 210,
+        "source": (
+            "docs/MATRIX-2026-09-04.md (2026-09-04): -50 mV/210 W has the "
+            "highest measured sustained throughput (39.62 gen tok/s) of "
+            "the four tested offsets with zero instability (0 errors, all "
+            "gates PASS); -75/-100 mV are flat to slightly lower and buy "
+            "nothing. Only a 210 W cap has been characterised so far, so "
+            "PERFORMANCE cannot yet be distinguished from EFFICIENCY at a "
+            "higher cap; this uses the conservative measured point rather "
+            "than guessing a higher one."
+        ),
+    },
+}
 
 SETTLE_S = 0.35
 RETRY_SLEEPS = (0.25, 0.5, 1.0)  # after first try: 4 attempts total
@@ -317,7 +384,281 @@ def validate_conf(conf: dict[str, str]) -> tuple[dict, list[str]]:
         problems.append(f"EVICT_GUARD_MARGIN={raw!r} is not a valid number")
         parsed["EVICT_GUARD_MARGIN"] = None
 
+    # PROFILE: unset (empty) / EFFICIENCY / BALANCED / PERFORMANCE / CUSTOM
+    raw = conf.get("PROFILE", "")
+    v = raw.strip().upper()
+    if v not in ("", "CUSTOM", *PROFILE_NAMES):
+        problems.append(
+            f"PROFILE={raw!r} must be unset or one of "
+            f"CUSTOM/{'/'.join(PROFILE_NAMES)}"
+        )
+        parsed["PROFILE"] = None
+    else:
+        parsed["PROFILE"] = v or None  # normalize "" to None (unset)
+
+    # FAN_CURVE_ENABLED: boolean 0 or 1
+    raw = conf.get("FAN_CURVE_ENABLED", "")
+    try:
+        v = int(raw) if raw != "" else 0
+        if v not in (0, 1):
+            problems.append(f"FAN_CURVE_ENABLED={v} must be 0 or 1")
+            parsed["FAN_CURVE_ENABLED"] = None
+        else:
+            parsed["FAN_CURVE_ENABLED"] = bool(v)
+    except (ValueError, TypeError):
+        problems.append(f"FAN_CURVE_ENABLED={raw!r} is not a valid boolean (0/1)")
+        parsed["FAN_CURVE_ENABLED"] = None
+
+    # FAN_HYSTERESIS_C: float 0..50 (default 3)
+    raw = conf.get("FAN_HYSTERESIS_C", "")
+    if raw == "":
+        parsed["FAN_HYSTERESIS_C"] = 3.0
+    else:
+        try:
+            v = float(raw)
+            if v < 0.0 or v > 50.0:
+                problems.append(f"FAN_HYSTERESIS_C={v} out of range 0..50")
+                parsed["FAN_HYSTERESIS_C"] = None
+            else:
+                parsed["FAN_HYSTERESIS_C"] = v
+        except (ValueError, TypeError):
+            problems.append(f"FAN_HYSTERESIS_C={raw!r} is not a valid number")
+            parsed["FAN_HYSTERESIS_C"] = None
+
+    # FAN_CURVE: "temp:pwm,temp:pwm,...". Always validated when a non-empty
+    # string is given. An invalid curve is reported as a *non-fatal* config
+    # problem (prefixed "fan curve", like "unknown key") — it never aborts
+    # the daemon; it just leaves the fan on firmware control. If
+    # FAN_CURVE_ENABLED=1 but FAN_CURVE is empty, that is reported too.
+    raw = conf.get("FAN_CURVE", "")
+    if raw.strip():
+        curve, curve_problems = parse_fan_curve(raw)
+        if curve_problems:
+            parsed["FAN_CURVE"] = None
+            for p in curve_problems:
+                problems.append(f"fan curve: {p}")
+        else:
+            parsed["FAN_CURVE"] = curve
+    else:
+        parsed["FAN_CURVE"] = None
+        if parsed.get("FAN_CURVE_ENABLED"):
+            problems.append("fan curve: FAN_CURVE_ENABLED=1 but FAN_CURVE has no points")
+
     return parsed, problems
+
+
+# ---------------------------------------------------------------------------
+# Fan curve: pure parsing/interpolation (no sysfs) + hwmon apply helpers
+# ---------------------------------------------------------------------------
+
+
+def parse_fan_curve(raw: str) -> tuple[list[tuple[float, float]] | None, list[str]]:
+    """Parse and validate a FAN_CURVE string "temp:pwm,temp:pwm,...".
+
+    Returns (points, problems). points is a list of (temp_c, pwm_pct)
+    tuples sorted by temp, or None if invalid. Rules: at least two points,
+    temp in 0..110, pwm in 0..100, no duplicate temps, monotonic
+    non-decreasing in both temp and pwm (a valid "curve" never cools the
+    fan down as temp rises).
+    """
+    problems: list[str] = []
+    text = (raw or "").strip()
+    if not text:
+        return None, ["no points given"]
+    points: list[tuple[float, float]] = []
+    for chunk in text.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if ":" not in chunk:
+            problems.append(f"point {chunk!r} is not temp:pwm")
+            continue
+        t_raw, p_raw = chunk.split(":", 1)
+        try:
+            t = float(t_raw.strip())
+            p = float(p_raw.strip())
+        except ValueError:
+            problems.append(f"point {chunk!r} is not numeric")
+            continue
+        if t < 0 or t > 110:
+            problems.append(f"temp {t} out of range 0..110")
+            continue
+        if p < 0 or p > 100:
+            problems.append(f"pwm {p} out of range 0..100")
+            continue
+        points.append((t, p))
+    if problems:
+        return None, problems
+    if len(points) < 2:
+        return None, ["at least two points are required"]
+    points.sort(key=lambda pt: pt[0])
+    temps = [t for t, _ in points]
+    if len(set(temps)) != len(temps):
+        return None, ["duplicate temperature points"]
+    for i in range(1, len(points)):
+        if points[i][0] <= points[i - 1][0]:
+            return None, ["temp points must be strictly increasing"]
+        if points[i][1] < points[i - 1][1]:
+            return None, ["pwm points must be monotonically non-decreasing with temp"]
+    return points, []
+
+
+def fan_curve_interpolate(curve: list[tuple[float, float]], temp_c: float) -> float:
+    """Pure linear interpolation, clamped at both ends. No sysfs."""
+    if not curve:
+        raise ValueError("empty curve")
+    if temp_c <= curve[0][0]:
+        return curve[0][1]
+    if temp_c >= curve[-1][0]:
+        return curve[-1][1]
+    for (t0, p0), (t1, p1) in zip(curve, curve[1:]):
+        if t0 <= temp_c <= t1:
+            if t1 == t0:
+                return p1
+            frac = (temp_c - t0) / (t1 - t0)
+            return p0 + frac * (p1 - p0)
+    return curve[-1][1]  # unreachable given a validated curve
+
+
+def fan_target_pwm(
+    curve: list[tuple[float, float]],
+    temp_c: float,
+    hysteresis_c: float,
+    last_pwm: float | None,
+    peak_temp: float | None,
+) -> tuple[float, float]:
+    """Pure function: compute (new_pwm, new_peak_temp). No sysfs.
+
+    Hysteresis applies on the way down only: once temp rises and raises
+    the fan, the fan speed only drops once temp falls hysteresis_c below
+    the peak temp that raised it. A rising temp always tracks the curve
+    immediately (no flapping-protection needed on the way up).
+    """
+    if peak_temp is None or temp_c > peak_temp:
+        peak_temp = temp_c
+    raw_target = fan_curve_interpolate(curve, temp_c)
+    if last_pwm is None:
+        return raw_target, peak_temp
+    if raw_target >= last_pwm:
+        # Rising (or flat): track the curve immediately, and the new peak
+        # becomes the reference point for any future hysteresis-gated drop.
+        return raw_target, temp_c if temp_c >= peak_temp else peak_temp
+    # Falling: only drop once temp has fallen hysteresis_c below the peak.
+    if peak_temp - temp_c < hysteresis_c:
+        return last_pwm, peak_temp
+    return raw_target, peak_temp
+
+
+def read_fan_mode(pci: Path) -> int:
+    h = hwmon_dir(pci)
+    if h is None:
+        raise RuntimeError("no hwmon")
+    return int(read_text(h / "pwm1_enable"))
+
+
+def write_fan_mode(pci: Path, mode: int) -> None:
+    h = hwmon_dir(pci)
+    if h is None:
+        raise RuntimeError("no hwmon")
+    write_text(h / "pwm1_enable", f"{int(mode)}\n")
+
+
+def write_fan_pwm(pci: Path, pct: float) -> None:
+    h = hwmon_dir(pci)
+    if h is None:
+        raise RuntimeError("no hwmon")
+    raw = max(0, min(255, round(pct / 100.0 * 255)))
+    write_text(h / "pwm1", f"{raw}\n")
+
+
+def read_fan_pwm_pct(pci: Path) -> float:
+    h = hwmon_dir(pci)
+    if h is None:
+        raise RuntimeError("no hwmon")
+    raw = int(read_text(h / "pwm1"))
+    return raw / 255.0 * 100.0
+
+
+def release_fan_to_firmware(pci: Path) -> None:
+    """Best-effort: hand fan control back to firmware (pwm1_enable=2).
+
+    Single write, no read-back, never raises. Used on every exit path
+    (clean stop, SIGTERM/SIGINT, unhandled exception, suspend transition,
+    reset) so a crash can never leave manual PWM set. Callers are
+    responsible for only invoking this while the card is active (writing
+    hwmon while suspended is exactly what the hard rules forbid); this
+    function itself does not check runtime_status so it stays a pure
+    single-write primitive that is safe to call from a `finally` block.
+    """
+    try:
+        write_fan_mode(pci, 2)
+        log("fan control released to firmware (pwm1_enable=2)")
+    except Exception as e:
+        log(f"fan curve: firmware release failed: {e}", syslog.LOG_ERR)
+
+
+def read_fan_temp_c(pci: Path) -> float:
+    """Junction temperature in degrees C (temp2_input), the curve's input."""
+    h = hwmon_dir(pci)
+    if h is None:
+        raise RuntimeError("no hwmon")
+    raw = int(read_text(h / "temp2_input"))
+    return raw / 1000.0
+
+
+def fan_controller_poll(pci: Path, conf: dict) -> None:
+    """Active-only fan curve poll: one call per watch-loop iteration.
+
+    Caller MUST only invoke this while runtime_status == 'active' (never
+    while suspended). Reuses the watcher's existing poll; adds no new
+    timer. If the curve is disabled or invalid, releases to firmware
+    (idempotent) and returns.
+    """
+    curve = conf.get("FAN_CURVE")
+    if not conf.get("FAN_CURVE_ENABLED") or not curve:
+        if _fan.mode == "manual":
+            release_fan_to_firmware(pci)
+            _fan.mode = "firmware"
+            _fan.last_pwm = None
+            _fan.peak_temp = None
+        return
+
+    hysteresis = conf.get("FAN_HYSTERESIS_C", 3.0)
+    try:
+        temp_c = read_fan_temp_c(pci)
+    except Exception as e:
+        log(f"fan curve: temp read failed: {e}", syslog.LOG_WARNING)
+        return
+
+    target, peak = fan_target_pwm(curve, temp_c, hysteresis, _fan.last_pwm, _fan.peak_temp)
+    _fan.peak_temp = peak
+
+    if _fan.mode != "manual":
+        try:
+            write_fan_mode(pci, 1)
+        except Exception as e:
+            log(f"fan curve: failed to enter manual mode: {e}", syslog.LOG_ERR)
+            return
+        _fan.mode = "manual"
+
+    if _fan.last_pwm is None or abs(target - _fan.last_pwm) >= 1:
+        try:
+            write_fan_pwm(pci, target)
+        except Exception as e:
+            log(f"fan curve: pwm write failed: {e}", syslog.LOG_ERR)
+            return
+        _fan.last_pwm = target
+
+
+def fan_release_if_manual(pci: Path | None) -> None:
+    """Release to firmware iff the in-process controller thinks it is
+    holding manual mode. Safe to call unconditionally (idempotent, and a
+    no-op when pci is None because there is nothing to write to)."""
+    if _fan.mode == "manual" and pci is not None:
+        release_fan_to_firmware(pci)
+    _fan.mode = "firmware"
+    _fan.last_pwm = None
+    _fan.peak_temp = None
 
 
 # ---------------------------------------------------------------------------
@@ -1193,6 +1534,45 @@ def _evict_guard_state(conf: dict, pci=None) -> dict:
             "gtt_total": gtt, "margin": margin}
 
 
+def _fan_status(conf: dict, pci: Path, st: str) -> dict:
+    """PM-safe snapshot of the fan-curve config/mode for status/status --json.
+
+    Never reads pwm1_enable/pwm1/fan1_input while not active (the hard
+    rule: no hwmon reads while suspended). `status`/`doctor` run as their
+    own process, so — like _evict_guard_state — this can only report what
+    is on disk (the validated config) plus what is safe to read live.
+    """
+    enabled = bool(conf.get("FAN_CURVE_ENABLED"))
+    curve = conf.get("FAN_CURVE")
+    curve_str = points_to_conf_string(curve) if curve else None
+    out = {
+        "enabled": enabled,
+        "curve": curve_str,
+        "hysteresis_c": conf.get("FAN_HYSTERESIS_C"),
+        "mode": None,
+        "pwm_pct": None,
+        "rpm": None,
+    }
+    if st != "active":
+        return out
+    try:
+        mode_val = read_fan_mode(pci)
+        out["mode"] = "manual" if mode_val == 1 else "firmware"
+    except Exception:
+        out["mode"] = None
+    try:
+        out["pwm_pct"] = round(read_fan_pwm_pct(pci), 1)
+    except Exception:
+        pass
+    try:
+        h = hwmon_dir(pci)
+        if h is not None:
+            out["rpm"] = int(read_text(h / "fan1_input"))
+    except Exception:
+        pass
+    return out
+
+
 def build_status_payload(conf: dict) -> dict:
     """Build a machine-readable status snapshot (schema_version=1).
 
@@ -1211,6 +1591,7 @@ def build_status_payload(conf: dict) -> dict:
     tuned = {
         "offset_mv": conf.get("VOLTAGE_OFFSET_MV"),
         "cap_w": conf.get("POWER_LIMIT_W"),
+        "profile": conf.get("PROFILE"),
     }
     state_data = read_state()
     payload = {
@@ -1232,6 +1613,7 @@ def build_status_payload(conf: dict) -> dict:
         },
         "evict_guard": _evict_guard_state(conf, pci),
         "state": state_data.get("state"),
+        "fan": _fan_status(conf, pci, st),
     }
     if st != "active":
         cached = load_ranges()
@@ -1314,6 +1696,11 @@ def cmd_status(conf: dict, *, as_json: bool = False) -> int:
                 f"vo={cached['vo_min_mv']}..{cached['vo_max_mv']} mV "
                 f"(age={age}s)"
             )
+        fan = _fan_status(conf, pci, st)
+        print(
+            f"fan_curve: enabled={fan['enabled']} curve={fan['curve']} "
+            "mode=skipped (not active) pwm=null rpm=null"
+        )
         return 0
     try:
         cap = read_power_cap(pci)
@@ -1334,6 +1721,11 @@ def cmd_status(conf: dict, *, as_json: bool = False) -> int:
         )
     except Exception as e:
         print(f"pp_od_clk_voltage=error {e}")
+    fan = _fan_status(conf, pci, st)
+    print(
+        f"fan_curve: enabled={fan['enabled']} curve={fan['curve']} "
+        f"mode={fan['mode']} pwm={fan['pwm_pct']} rpm={fan['rpm']}"
+    )
     return 0
 
 
@@ -1408,6 +1800,12 @@ def cmd_reset(conf: dict) -> int:
     except Exception as e:
         log(f"OD reset failed: {e}", syslog.LOG_ERR)
         failed = True
+    # Fan curve: reset is one of the mandated firmware-fallback exit
+    # points. release_fan_to_firmware() is best-effort and never raises;
+    # do it unconditionally so `reset` always leaves firmware fan control
+    # even if this process never ran `watch` (e.g. a manual pwm1_enable=1
+    # was left by a crashed prior instance).
+    release_fan_to_firmware(pci)
     return 1 if failed else 0
 
 
@@ -1511,7 +1909,7 @@ def cmd_set_power_cap(conf: dict, watts: int) -> int:
     return cmd_apply(conf)
 
 
-def cmd_set_tuning(conf: dict, mv: int, watts: int) -> int:
+def cmd_set_tuning(conf: dict, mv: int, watts: int, *, profile: str = "CUSTOM") -> int:
     """Atomically set VOLTAGE_OFFSET_MV and POWER_LIMIT_W together.
 
     Both values are validated against ONE range snapshot (live ranges
@@ -1520,6 +1918,11 @@ def cmd_set_tuning(conf: dict, mv: int, watts: int) -> int:
     (set_conf_values). When active, apply is attempted once; on any
     failure the prior config is restored (also via a single atomic
     write) before returning nonzero.
+
+    `profile` is the PROFILE value stamped alongside the tuning values
+    in that same atomic write: explicit set-tuning calls (the default)
+    mark the config CUSTOM; cmd_set_profile passes the resolved profile
+    name so the whole (offset, cap, profile) triple lands in one write.
     """
     if mv > 0:
         die("VDDGFX offset must be <= 0 mV")
@@ -1565,14 +1968,17 @@ def cmd_set_tuning(conf: dict, mv: int, watts: int) -> int:
 
     prior_mv = conf["VOLTAGE_OFFSET_MV"]
     prior_watts = conf["POWER_LIMIT_W"]
+    prior_profile = conf.get("PROFILE")
 
     set_conf_values(CONF_PATH, {
         "VOLTAGE_OFFSET_MV": str(mv),
         "POWER_LIMIT_W": str(watts),
+        "PROFILE": profile,
     })
-    log(f"config VOLTAGE_OFFSET_MV={mv} POWER_LIMIT_W={watts}")
+    log(f"config VOLTAGE_OFFSET_MV={mv} POWER_LIMIT_W={watts} PROFILE={profile}")
     conf["VOLTAGE_OFFSET_MV"] = mv
     conf["POWER_LIMIT_W"] = watts
+    conf["PROFILE"] = profile
 
     rc = cmd_apply(conf)
     if rc != 0:
@@ -1585,11 +1991,130 @@ def cmd_set_tuning(conf: dict, mv: int, watts: int) -> int:
         set_conf_values(CONF_PATH, {
             "VOLTAGE_OFFSET_MV": str(prior_mv),
             "POWER_LIMIT_W": str(prior_watts),
+            "PROFILE": prior_profile or "",
         })
         conf["VOLTAGE_OFFSET_MV"] = prior_mv
         conf["POWER_LIMIT_W"] = prior_watts
+        conf["PROFILE"] = prior_profile
         return rc
     return 0
+
+
+def resolve_profile(name: str) -> tuple[int, int]:
+    """Resolve a profile name to (offset_mv, cap_w). Dies on unknown name."""
+    key = name.strip().upper()
+    if key not in PROFILES:
+        die(f"unknown profile {name!r}; valid profiles: {'/'.join(PROFILE_NAMES)}")
+    p = PROFILES[key]
+    return p["offset_mv"], p["cap_w"]
+
+
+def cmd_set_profile(conf: dict, name: str) -> int:
+    """Resolve a named profile and apply it via the exact set-tuning path.
+
+    Resolution (unknown-name rejection) happens before any mutation.
+    Does not duplicate set-tuning's validation/atomicity: the resolved
+    (offset_mv, cap_w, profile-name) triple is handed to cmd_set_tuning,
+    which performs the single range-validated atomic write and apply.
+    """
+    mv, watts = resolve_profile(name)
+    return cmd_set_tuning(conf, mv, watts, profile=name.strip().upper())
+
+
+def cmd_list_profiles(conf: dict, *, as_json: bool = False) -> int:
+    active = conf.get("PROFILE")
+    rows = []
+    for name in PROFILE_NAMES:
+        p = PROFILES[name]
+        rows.append({
+            "name": name,
+            "offset_mv": p["offset_mv"],
+            "cap_w": p["cap_w"],
+            "source": p["source"],
+            "active": name == active,
+        })
+    if as_json:
+        print(json.dumps({"profiles": rows, "active": active}))
+        return 0
+    for r in rows:
+        marker = " *" if r["active"] else ""
+        print(
+            f"{r['name']}: offset_mv={r['offset_mv']} cap_w={r['cap_w']}{marker}"
+        )
+        print(f"  source: {r['source']}")
+    return 0
+
+
+def cmd_set_fan_curve(conf: dict, points: str | None, *, off: bool) -> int:
+    """Validate and atomically write FAN_CURVE / FAN_CURVE_ENABLED.
+
+    Mirrors cmd_set_tuning's semantics: validated before any write, a
+    single atomic config write for both keys together (so a reader never
+    observes FAN_CURVE_ENABLED=1 with a stale/partial FAN_CURVE), and on
+    any post-write failure the prior config is restored atomically.
+
+    This command never touches sysfs directly — it has no "apply" step
+    like set-tuning's power-cap/VO write, because the fan controller only
+    runs inside the active-only watch loop poll (the whole point of the
+    safety contract is that fan hwmon writes happen nowhere else). The
+    running watcher picks up the new curve on its next config reload.
+    """
+    if off:
+        prior_enabled = conf.get("FAN_CURVE_ENABLED")
+        prior_curve_raw = None  # not touched; only FAN_CURVE_ENABLED changes
+        set_conf_value(CONF_PATH, "FAN_CURVE_ENABLED", "0")
+        log("config FAN_CURVE_ENABLED=0 (fan curve off, firmware control)")
+        conf["FAN_CURVE_ENABLED"] = False
+        return 0
+
+    if points is None:
+        die("set-fan-curve requires <points> (e.g. 40:0,55:30,70:55,85:100) or --off")
+
+    curve, problems = parse_fan_curve(points)
+    if problems:
+        die("invalid fan curve: " + "; ".join(problems))
+
+    prior_curve = conf.get("FAN_CURVE")
+    prior_enabled = conf.get("FAN_CURVE_ENABLED")
+
+    set_conf_values(CONF_PATH, {
+        "FAN_CURVE": points,
+        "FAN_CURVE_ENABLED": "1",
+    })
+    log(f"config FAN_CURVE={points} FAN_CURVE_ENABLED=1")
+    conf["FAN_CURVE"] = curve
+    conf["FAN_CURVE_ENABLED"] = True
+
+    # Re-read and re-validate from disk to prove the atomic write landed
+    # cleanly (same discipline as set-tuning's read-back-after-write via
+    # cmd_apply, adapted to a config-only mutation with no sysfs step).
+    raw = load_conf(CONF_PATH)
+    _parsed, verify_problems = validate_conf(raw)
+    fatal = [
+        p for p in verify_problems
+        if not p.startswith("unknown key") and not p.startswith("fan curve")
+    ]
+    if fatal or any(p.startswith("fan curve") for p in verify_problems):
+        log(
+            f"set-fan-curve: post-write validation failed, restoring prior config: "
+            f"{'; '.join(verify_problems)}",
+            syslog.LOG_ERR,
+        )
+        set_conf_values(CONF_PATH, {
+            "FAN_CURVE": "" if prior_curve is None else points_to_conf_string(prior_curve),
+            "FAN_CURVE_ENABLED": "1" if prior_enabled else "0",
+        })
+        conf["FAN_CURVE"] = prior_curve
+        conf["FAN_CURVE_ENABLED"] = prior_enabled
+        return 1
+    return 0
+
+
+def points_to_conf_string(points: list[tuple[float, float]]) -> str:
+    """Inverse of parse_fan_curve: render points back to "temp:pwm,..."."""
+    def _fmt(x: float) -> str:
+        return str(int(x)) if float(x).is_integer() else str(x)
+    return ",".join(f"{_fmt(t)}:{_fmt(p)}" for t, p in points)
 
 
 def handle_wake(pci: Path, conf: dict, cap_checked: bool) -> bool:
@@ -1698,6 +2223,26 @@ def cmd_watch(conf: dict) -> int:
                 syslog.LOG_WARNING,
             )
 
+    # --- Fan curve: startup orphan check ---------------------------------
+    # A previous instance may have crashed (or been SIGKILLed) while
+    # holding pwm1_enable=1 with nobody left to release it. This process
+    # has no live controller state yet (module import defaults to
+    # "firmware"), so if we find pwm1_enable=1 while active, that PWM
+    # value has no owner: release it now rather than adopt it (fan
+    # control, unlike the eviction guard, only fails safe by returning
+    # to firmware; there is no "hold" worth preserving across restarts).
+    if pci is not None and is_active(pci):
+        try:
+            if read_fan_mode(pci) == 1:
+                log(
+                    "fan curve: found pwm1_enable=1 with no live controller at "
+                    "startup; releasing to firmware",
+                    syslog.LOG_WARNING,
+                )
+                release_fan_to_firmware(pci)
+        except Exception as e:
+            log(f"fan curve: startup orphan check failed: {e}", syslog.LOG_WARNING)
+
     state = ST_SUSPENDED
     cap_checked = False
     last_good = conf  # last successfully validated config
@@ -1709,199 +2254,241 @@ def cmd_watch(conf: dict) -> int:
     # "unreadable" warning: only log when transitioning good→None).
     _susp_prev_ok = False
 
-    # Initial edge: if already active, treat as unconfigured (boot / daemon start).
-    if pci is not None and is_active(pci):
-        state = ST_ACTIVE_UNCONFIGURED
-        cap_checked = handle_wake(pci, last_good, cap_checked)
-        state = ST_ACTIVE_CONFIGURED
-        # Update baseline with None-safety: never overwrite a good value.
-        _new_susp = runtime_suspended_ms(pci)
-        if _new_susp is None:
-            if _susp_prev_ok:
-                log(
-                    "runtime_suspended_time unreadable; counter wake detection degraded",
-                    syslog.LOG_WARNING,
-                )
-            _susp_prev_ok = False
-        else:
-            susp_at_last_wake = _new_susp
-            _susp_prev_ok = True
-    elif pci is not None:
-        state = ST_SUSPENDED
-
-    while not _stop:
-        try:
-            # Reload config with validation (explicit CONF_PATH to avoid
-            # stale default-arg binding).
-            raw = load_conf(CONF_PATH)
-            parsed, problems = validate_conf(raw)
-            fatal = [p for p in problems if not p.startswith("unknown key")]
-            if fatal:
-                warn_text = "; ".join(problems)
-                if warn_text != last_warn_text:
+    try:
+        # Initial edge: if already active, treat as unconfigured (boot / daemon start).
+        if pci is not None and is_active(pci):
+            state = ST_ACTIVE_UNCONFIGURED
+            cap_checked = handle_wake(pci, last_good, cap_checked)
+            state = ST_ACTIVE_CONFIGURED
+            # Update baseline with None-safety: never overwrite a good value.
+            _new_susp = runtime_suspended_ms(pci)
+            if _new_susp is None:
+                if _susp_prev_ok:
                     log(
-                        f"config reload failed, keeping last good: {warn_text}",
+                        "runtime_suspended_time unreadable; counter wake detection degraded",
                         syslog.LOG_WARNING,
                     )
-                    last_warn_text = warn_text
-                # keep using last_good
-            else:
-                if last_warn_text is not None:
-                    log("config OK again")
-                    last_warn_text = None
-                if problems:
-                    unknown_text = "; ".join(problems)
-                    if unknown_text != last_unknown_warn:
-                        log(unknown_text, syslog.LOG_WARNING)
-                        last_unknown_warn = unknown_text
-                else:
-                    last_unknown_warn = None
-                last_good = parsed
-
-            conf_now = last_good
-            interval = max(1.0, min(60.0, float(conf_now.get("POLL_INTERVAL_S", 2.0))))
-
-            pci = discover(conf_now, required=False)
-            if pci is None:
-                # Device gone: reset state so next appearance is a wake.
-                if was_present:
-                    log("R9700 not present", syslog.LOG_WARNING)
-                    was_present = False
-                state = ST_SUSPENDED
-                susp_at_last_wake = None
                 _susp_prev_ok = False
-                time.sleep(interval)
-                continue
+            else:
+                susp_at_last_wake = _new_susp
+                _susp_prev_ok = True
+        elif pci is not None:
+            state = ST_SUSPENDED
 
-            if not was_present:
-                log(f"R9700 discovered at {pci.name}")
-                was_present = True
-
-            st = runtime_status(pci)
-            # Only "active" is a rising edge; only "suspended" is a falling edge.
-            # "unreadable:...", "suspending", "resuming" are NOT transitions.
-            if st == "active":
-                wake_detected = False
-                via_counter = False
-
-                if state == ST_SUSPENDED:
-                    # Plain edge (suspended→active): no counter read needed.
-                    wake_detected = True
-                else:
-                    # Counter-based detection (only when the edge path did
-                    # not already fire, to avoid an extra sysfs read).
-                    now_susp = runtime_suspended_ms(pci)
-                    # A counter that stops being readable while active means
-                    # detection is degraded until it returns; say so once.
-                    if now_susp is None:
-                        if _susp_prev_ok:
-                            log(
-                                "runtime_suspended_time unreadable; counter wake detection degraded",
-                                syslog.LOG_WARNING,
-                            )
-                        _susp_prev_ok = False
-                    elif not _susp_prev_ok and susp_at_last_wake is not None:
-                        _susp_prev_ok = True
-                    if (
-                        now_susp is not None
-                        and susp_at_last_wake is not None
-                        and now_susp > susp_at_last_wake
-                    ):
-                        wake_detected = True
-                        via_counter = True
-                    elif (
-                        now_susp is not None
-                        and susp_at_last_wake is not None
-                        and now_susp < susp_at_last_wake
-                    ):
-                        # Driver rebind/reset reset the counter to a lower value.
+        while not _stop:
+            try:
+                # Reload config with validation (explicit CONF_PATH to avoid
+                # stale default-arg binding).
+                raw = load_conf(CONF_PATH)
+                parsed, problems = validate_conf(raw)
+                fatal = [
+                    p for p in problems
+                    if not p.startswith("unknown key") and not p.startswith("fan curve")
+                ]
+                if fatal:
+                    warn_text = "; ".join(problems)
+                    if warn_text != last_warn_text:
                         log(
-                            f"runtime_suspended_time regressed "
-                            f"({susp_at_last_wake}→{now_susp}); driver rebind?",
+                            f"config reload failed, keeping last good: {warn_text}",
                             syslog.LOG_WARNING,
                         )
-                        wake_detected = True
-
-                if wake_detected:
-                    if via_counter:
-                        log(
-                            "R9700 runtime active (resume detected via "
-                            "runtime_suspended_time, suspended sample not observed)"
-                        )
-                    state = ST_ACTIVE_UNCONFIGURED
-                    cap_checked = handle_wake(pci, conf_now, cap_checked)
-                    state = ST_ACTIVE_CONFIGURED
-                    # Update baseline with None-safety.
-                    _new_susp = runtime_suspended_ms(pci)
-                    if _new_susp is None:
-                        if _susp_prev_ok:
-                            log(
-                                "runtime_suspended_time unreadable; counter wake detection degraded",
-                                syslog.LOG_WARNING,
-                            )
-                        _susp_prev_ok = False
+                        last_warn_text = warn_text
+                    # keep using last_good
+                else:
+                    if last_warn_text is not None:
+                        log("config OK again")
+                        last_warn_text = None
+                    if problems:
+                        unknown_text = "; ".join(problems)
+                        if unknown_text != last_unknown_warn:
+                            log(unknown_text, syslog.LOG_WARNING)
+                            last_unknown_warn = unknown_text
                     else:
-                        susp_at_last_wake = _new_susp
-                        _susp_prev_ok = True
+                        last_unknown_warn = None
+                    last_good = parsed
 
-                # --- Eviction guard: hold/release power/control ---------
-                if conf_now.get("EVICT_GUARD"):
-                    vo = conf_now["VOLTAGE_OFFSET_MV"]
-                    vram = drm_vram_in_use(pci.name)
-                    margin = conf_now["EVICT_GUARD_MARGIN"]
-                    gtt = gtt_total_bytes(pci)  # cached after first call
+                conf_now = last_good
+                interval = max(1.0, min(60.0, float(conf_now.get("POLL_INTERVAL_S", 2.0))))
 
-                    if not _evict.holding and vram > margin * gtt:
-                        write_sysfs(pci / "power" / "control", "on")
-                        _evict.holding = True
-                        _evict.last_vram = vram
-                        _evict.last_gtt = gtt
-                        if not _evict.logged_hold:
+                pci = discover(conf_now, required=False)
+                if pci is None:
+                    # Device gone: reset state so next appearance is a wake.
+                    if was_present:
+                        log("R9700 not present", syslog.LOG_WARNING)
+                        was_present = False
+                    state = ST_SUSPENDED
+                    susp_at_last_wake = None
+                    _susp_prev_ok = False
+                    # No pci to write to; the controller's in-process state
+                    # still needs to forget it was ever "manual".
+                    _fan.mode = "firmware"
+                    _fan.last_pwm = None
+                    _fan.peak_temp = None
+                    time.sleep(interval)
+                    continue
+
+                if not was_present:
+                    log(f"R9700 discovered at {pci.name}")
+                    was_present = True
+
+                st = runtime_status(pci)
+                # Only "active" is a rising edge; only "suspended" is a falling edge.
+                # "unreadable:...", "suspending", "resuming" are NOT transitions.
+                if st == "active":
+                    wake_detected = False
+                    via_counter = False
+
+                    if state == ST_SUSPENDED:
+                        # Plain edge (suspended→active): no counter read needed.
+                        wake_detected = True
+                    else:
+                        # Counter-based detection (only when the edge path did
+                        # not already fire, to avoid an extra sysfs read).
+                        now_susp = runtime_suspended_ms(pci)
+                        # A counter that stops being readable while active means
+                        # detection is degraded until it returns; say so once.
+                        if now_susp is None:
+                            if _susp_prev_ok:
+                                log(
+                                    "runtime_suspended_time unreadable; counter wake detection degraded",
+                                    syslog.LOG_WARNING,
+                                )
+                            _susp_prev_ok = False
+                        elif not _susp_prev_ok and susp_at_last_wake is not None:
+                            _susp_prev_ok = True
+                        if (
+                            now_susp is not None
+                            and susp_at_last_wake is not None
+                            and now_susp > susp_at_last_wake
+                        ):
+                            wake_detected = True
+                            via_counter = True
+                        elif (
+                            now_susp is not None
+                            and susp_at_last_wake is not None
+                            and now_susp < susp_at_last_wake
+                        ):
+                            # Driver rebind/reset reset the counter to a lower value.
                             log(
-                                "evict-guard: holding dGPU awake — VRAM "
-                                f"{vram/1e9:.1f}G > {margin*100:.0f}% of GTT "
-                                f"{gtt/1e9:.1f}G",
+                                f"runtime_suspended_time regressed "
+                                f"({susp_at_last_wake}→{now_susp}); driver rebind?",
                                 syslog.LOG_WARNING,
                             )
-                            _evict.logged_hold = True
-                            _evict.logged_release = False
-                        write_state(state="ACTIVE_HELD", pci=pci, vo=vo,
-                                    vram_used=vram, gtt_total=gtt)
-                    elif _evict.holding and vram < 0.8 * margin * gtt:
-                        write_sysfs(pci / "power" / "control", "auto")
-                        _evict.holding = False
-                        if not _evict.logged_release:
-                            log(
-                                "evict-guard: released hold — VRAM "
-                                f"{vram/1e9:.1f}G < {0.8*margin*100:.0f}% of "
-                                f"GTT {gtt/1e9:.1f}G"
-                            )
-                            _evict.logged_release = True
-                            _evict.logged_hold = False
-                        write_state(state="ACTIVE_CONFIGURED", pci=pci, vo=vo)
-            elif st == "suspended":
-                if state != ST_SUSPENDED:
-                    log("R9700 runtime suspended")
-                    state = ST_SUSPENDED
-                    write_state(f"pci={pci.name}\nstate=SUSPENDED\nts={int(time.time())}\n")
-            # else: transitional/unreadable — just sleep and poll again
-        except Exception as e:
-            log(f"watcher loop error: {e}", syslog.LOG_WARNING)
-            # Reset so a failure inside the wake path cannot leave the
-            # machine stuck in ACTIVE_UNCONFIGURED; the next active poll
-            # re-applies once via the edge path.
-            state = ST_SUSPENDED
-        time.sleep(interval)
+                            wake_detected = True
 
-    log("watcher stopping")
-    # --- Eviction guard: release any held hold on shutdown -------------
-    if _evict.holding:
-        if pci is not None:
-            write_sysfs(pci / "power" / "control", "auto")
-        _evict.holding = False
-        log("evict-guard: released hold on shutdown")
-        vo = last_good.get("VOLTAGE_OFFSET_MV")
-        write_state(state="ACTIVE_CONFIGURED", pci=pci, vo=vo)
+                    if wake_detected:
+                        if via_counter:
+                            log(
+                                "R9700 runtime active (resume detected via "
+                                "runtime_suspended_time, suspended sample not observed)"
+                            )
+                        state = ST_ACTIVE_UNCONFIGURED
+                        cap_checked = handle_wake(pci, conf_now, cap_checked)
+                        state = ST_ACTIVE_CONFIGURED
+                        # Update baseline with None-safety.
+                        _new_susp = runtime_suspended_ms(pci)
+                        if _new_susp is None:
+                            if _susp_prev_ok:
+                                log(
+                                    "runtime_suspended_time unreadable; counter wake detection degraded",
+                                    syslog.LOG_WARNING,
+                                )
+                            _susp_prev_ok = False
+                        else:
+                            susp_at_last_wake = _new_susp
+                            _susp_prev_ok = True
+
+                    # --- Eviction guard: hold/release power/control ---------
+                    if conf_now.get("EVICT_GUARD"):
+                        vo = conf_now["VOLTAGE_OFFSET_MV"]
+                        vram = drm_vram_in_use(pci.name)
+                        margin = conf_now["EVICT_GUARD_MARGIN"]
+                        gtt = gtt_total_bytes(pci)  # cached after first call
+
+                        if not _evict.holding and vram > margin * gtt:
+                            write_sysfs(pci / "power" / "control", "on")
+                            _evict.holding = True
+                            _evict.last_vram = vram
+                            _evict.last_gtt = gtt
+                            if not _evict.logged_hold:
+                                log(
+                                    "evict-guard: holding dGPU awake — VRAM "
+                                    f"{vram/1e9:.1f}G > {margin*100:.0f}% of GTT "
+                                    f"{gtt/1e9:.1f}G",
+                                    syslog.LOG_WARNING,
+                                )
+                                _evict.logged_hold = True
+                                _evict.logged_release = False
+                            write_state(state="ACTIVE_HELD", pci=pci, vo=vo,
+                                        vram_used=vram, gtt_total=gtt)
+                        elif _evict.holding and vram < 0.8 * margin * gtt:
+                            write_sysfs(pci / "power" / "control", "auto")
+                            _evict.holding = False
+                            if not _evict.logged_release:
+                                log(
+                                    "evict-guard: released hold — VRAM "
+                                    f"{vram/1e9:.1f}G < {0.8*margin*100:.0f}% of "
+                                    f"GTT {gtt/1e9:.1f}G"
+                                )
+                                _evict.logged_release = True
+                                _evict.logged_hold = False
+                            write_state(state="ACTIVE_CONFIGURED", pci=pci, vo=vo)
+
+                    # --- Fan curve: active-only poll, reuses this same loop
+                    # tick (no new timer). Never reached while suspended.
+                    fan_controller_poll(pci, conf_now)
+                elif st == "suspended":
+                    if state != ST_SUSPENDED:
+                        log("R9700 runtime suspended")
+                        state = ST_SUSPENDED
+                        write_state(f"pci={pci.name}\nstate=SUSPENDED\nts={int(time.time())}\n")
+                    # Card just went (or already is) suspended: the fan
+                    # controller must never be the reason it stays awake,
+                    # and must never read hwmon while suspended. Release
+                    # eagerly (idempotent) rather than only on final exit.
+                    if _fan.mode == "manual":
+                        log(
+                            "fan curve: card suspended, releasing to firmware",
+                            syslog.LOG_WARNING,
+                        )
+                        fan_release_if_manual(None)  # no sysfs write while suspended
+                # else: transitional/unreadable — just sleep and poll again
+            except Exception as e:
+                log(f"watcher loop error: {e}", syslog.LOG_WARNING)
+                # Reset so a failure inside the wake path cannot leave the
+                # machine stuck in ACTIVE_UNCONFIGURED; the next active poll
+                # re-applies once via the edge path.
+                state = ST_SUSPENDED
+            time.sleep(interval)
+    finally:
+        log("watcher stopping")
+        # --- Eviction guard: release any held hold on shutdown -------------
+        if _evict.holding:
+            if pci is not None:
+                write_sysfs(pci / "power" / "control", "auto")
+            _evict.holding = False
+            log("evict-guard: released hold on shutdown")
+            vo = last_good.get("VOLTAGE_OFFSET_MV")
+            write_state(state="ACTIVE_CONFIGURED", pci=pci, vo=vo)
+        # --- Fan curve: firmware fallback on EVERY exit path ----------------
+        # Clean stop, SIGTERM/SIGINT (the flag just makes _stop true, this
+        # finally still runs), and any unhandled exception that escapes the
+        # per-iteration try above all land here. Only write if the card is
+        # active (writing hwmon while suspended is forbidden); if suspended
+        # or the card is gone there is nothing to release in firmware and
+        # nothing safe to read/write, so just forget the in-process state.
+        if _fan.mode == "manual":
+            if pci is not None and is_active(pci):
+                release_fan_to_firmware(pci)
+            else:
+                log(
+                    "fan curve: shutting down while not active; "
+                    "no hwmon write, controller state cleared",
+                    syslog.LOG_WARNING,
+                )
+            _fan.mode = "firmware"
+            _fan.last_pwm = None
+            _fan.peak_temp = None
     return 0
 
 
@@ -1976,6 +2563,17 @@ def build_parser() -> argparse.ArgumentParser:
                       help="VDDGFX offset in mV, e.g. -25")
     stn.add_argument("--cap-w", type=int, required=True,
                       help="Power cap in watts, e.g. 250")
+    spf = sub.add_parser("set-profile")
+    spf.add_argument("name", choices=list(PROFILE_NAMES),
+                      help="Named profile to apply")
+    lp = sub.add_parser("list-profiles")
+    lp.add_argument("--json", action="store_true", dest="json_out",
+                     help="emit machine-readable JSON")
+    sfc = sub.add_parser("set-fan-curve")
+    sfc.add_argument("points", nargs="?", default=None,
+                      help="temp:pwm points, e.g. 40:0,55:30,70:55,85:100")
+    sfc.add_argument("--off", action="store_true",
+                      help="disable the fan curve (firmware control)")
     sp = sub.add_parser("probe-poll")
     sp.add_argument("--seconds", type=int, default=30)
     dr = sub.add_parser("doctor")
@@ -1996,9 +2594,14 @@ def main(argv: list[str] | None = None) -> int:
     CONF_PATH = conf_path
     raw_conf = load_conf(conf_path)
 
-    # Typed validation: fatal problems abort; unknown keys only warn.
+    # Typed validation: fatal problems abort; unknown keys and fan-curve
+    # config errors only warn (an invalid fan curve runs on firmware
+    # control, not a startup abort).
     conf, problems = validate_conf(raw_conf)
-    fatal = [p for p in problems if not p.startswith("unknown key")]
+    fatal = [
+        p for p in problems
+        if not p.startswith("unknown key") and not p.startswith("fan curve")
+    ]
     if fatal:
         die("; ".join(problems))
     if problems:
@@ -2022,6 +2625,12 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_set_power_cap(conf, args.watts)
     if args.cmd == "set-tuning":
         return cmd_set_tuning(conf, args.offset_mv, args.cap_w)
+    if args.cmd == "set-profile":
+        return cmd_set_profile(conf, args.name)
+    if args.cmd == "list-profiles":
+        return cmd_list_profiles(conf, as_json=args.json_out)
+    if args.cmd == "set-fan-curve":
+        return cmd_set_fan_curve(conf, args.points, off=args.off)
     if args.cmd == "probe-poll":
         return cmd_probe_poll(conf, seconds=args.seconds)
     if args.cmd == "doctor":
