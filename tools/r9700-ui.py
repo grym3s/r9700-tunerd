@@ -158,6 +158,12 @@ class GpuSysfs:
         except OSError as e:
             if e.errno in (errno.EBUSY, errno.EAGAIN):
                 return None  # device suspended mid-read (TOCTOU)
+            if e.errno == errno.ENOENT:
+                # Sensor absent on this card (e.g. R9700 has no pwm1_enable —
+                # fan control lives in gpu_od/fan_ctrl/). Treat as "no value",
+                # same as any other missing sensor, instead of crashing the
+                # whole /api/status request.
+                return None
             raise
 
     def runtime_status(self):
