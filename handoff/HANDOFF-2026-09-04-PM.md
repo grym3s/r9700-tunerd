@@ -88,7 +88,7 @@ the owner's cold shutdown.
   each profile's list; delete them from the UI if they bother you.
 - The umbrella worktree `.worktrees/t_edfe740a` (Halo's 46-line partial)
   was removed by the orchestrator to free the shared branch. Codex's two
-  worktrees (`~/src/r9700-tunerd-worktrees/{ray,halo}`) were **not** touched;
+  worktrees (`~/AI Projects/r9700-tunerd/.worktrees/{ray,halo}`) were **not** touched;
   their content has been re-implemented on the R0.1 branches.
 
 ## 4. Next steps, in order
@@ -140,7 +140,7 @@ hermes kanban --board r9700-tunerd list            # board
 hermes kanban --board r9700-tunerd show <id>       # card, comments, events
 hermes kanban --board r9700-tunerd log <id>        # worker transcript
 hermes kanban --board r9700-tunerd create "<title>" --assignee sonnet \
-  --workspace worktree:/home/grymes/src/r9700-tunerd --branch wt/<name> \
+  --workspace "worktree:/home/grymes/AI Projects/r9700-tunerd" --branch wt/<name> \
   --project r9700-tunerd --body "<self-contained brief>"
 ```
 Assign construction to `sonnet`/`haiku`, reviews to `forge`, board
@@ -180,8 +180,8 @@ Re-arm both after boot if the session continues.
 
 The owner ruled that this tuner and DriverSense are separate projects with
 separate folders. From now on tuner sessions are opened in
-`~/src/r9700-tunerd` (Claude project memory now lives at
-`~/.claude/projects/-home-grymes-src-r9700-tunerd/memory`, seeded with the
+`~/AI Projects/r9700-tunerd` (Claude project memory now lives at
+`~/.claude/projects/-home-grymes-AI-Projects-r9700-tunerd/memory`, seeded with the
 tuner history, LM Studio/DFlash notes, Hermes team rules and the Omarchy
 desktop notes). Hermes board `r9700-tunerd` is this project's; DriverSense
 has its own board `driversense`. Nothing in this repo references the other

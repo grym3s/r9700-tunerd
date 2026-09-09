@@ -15,7 +15,7 @@ file records the exact repository state used to write it.
 
 ## Main and Release 0.1
 
-- Repository: `/home/grymes/src/r9700-tunerd`
+- Repository: `/home/grymes/AI Projects/r9700-tunerd`
 - Main HEAD audited: `c05b7bf`
 - Working tree was clean at the start of this continuation.
 - Release 0.1 implementation is merged: dashboard safety, app lifecycle, eviction

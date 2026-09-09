@@ -71,7 +71,7 @@ needs to choose the open-source license.
 
 ## Baseline and repository state
 
-Main repository: `/home/grymes/src/r9700-tunerd`
+Main repository: `/home/grymes/AI Projects/r9700-tunerd`
 
 - Branch: `main`
 - HEAD at stop: `348c66e`
@@ -97,7 +97,7 @@ Preserve all three modifications. Inspect and attribute them before committing.
 
 ### 1. Dashboard safety hardening — committed
 
-- Worktree: `/home/grymes/src/r9700-tunerd-worktrees/ray`
+- Worktree: `/home/grymes/AI Projects/r9700-tunerd/.worktrees/ray`
 - Branch: `codex/ray-ui-hardening`
 - Commit: `32aa430 ui: harden dashboard safety and status recovery`
 - Files: `tools/r9700-ui.py`, `tests/test_ui_server.py`
@@ -115,7 +115,7 @@ Preserve all three modifications. Inspect and attribute them before committing.
 
 ### 2. Native app lifecycle — uncommitted partial work
 
-- Worktree: `/home/grymes/src/r9700-tunerd-worktrees/halo`
+- Worktree: `/home/grymes/AI Projects/r9700-tunerd/.worktrees/halo`
 - Branch: `codex/halo-app-lifecycle`
 - Base/HEAD: `c1bbf27`
 - Modified: `tools/r9700-app.py`
@@ -130,7 +130,7 @@ Preserve all three modifications. Inspect and attribute them before committing.
 
 ### 3. Eviction-risk warning — uncommitted partial work
 
-- Worktree: `/home/grymes/src/r9700-tunerd/.worktrees/t_edfe740a`
+- Worktree: `/home/grymes/AI Projects/r9700-tunerd/.worktrees/t_edfe740a`
 - Branch: `wt/evict-guard`
 - Base/HEAD: `3101fd6`
 - Modified: `r9700-tunerd` (46 insertions, 1 deletion).

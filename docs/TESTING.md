@@ -144,7 +144,7 @@ Measured 2026-09-04: 20 s. A 2 s fixed sensor poll fails this test (card stays
 
 Start the server as a transient user unit so it survives the shell:
 
-    systemd-run --user --unit r9700-ui --working-directory=$HOME/src/r9700-tunerd --collect python3 tools/r9700-ui.py
+    systemd-run --user --unit r9700-ui --working-directory="$HOME/AI Projects/r9700-tunerd" --collect python3 tools/r9700-ui.py
     journalctl --user -u r9700-ui.service | grep TOKEN
 
 ## 6. Eviction guard acceptance

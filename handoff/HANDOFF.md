@@ -5,6 +5,8 @@ Owner: Richard Garnett (grymes). Machine: `Strix-AI`, Arch/Omarchy, Hyprland
 end of the 2026-09-03/04 build session. Everything below was measured on the
 live machine unless marked otherwise.
 
+**Location (moved 2026-09-09): this repo now lives at `~/AI Projects/r9700-tunerd` (was `~/src/r9700-tunerd`). The path contains a space — quote it in shell commands. Codex worktrees `halo`/`ray` moved from `~/src/r9700-tunerd-worktrees/` into `.worktrees/` inside the repo.**
+
 **Newer: `HANDOFF-2026-09-04-PM.md` is the current state and next steps (evening). This file is the morning history.**
 
 Companion documents in this folder:
@@ -48,13 +50,13 @@ addresses (the bus address is discovered at runtime and logged only).
 
 | Thing | Path |
 |---|---|
-| Repo (git, branch `main`) | `~/src/r9700-tunerd` |
+| Repo (git, branch `main`) | `~/AI Projects/r9700-tunerd` |
 | Installed daemon (byte-identical to repo) | `/usr/local/sbin/r9700-tunerd` |
 | Config | `/etc/r9700-tunerd.conf` (today: `POWER_LIMIT_W=210`, `VOLTAGE_OFFSET_MV=-50`) |
 | Watcher unit | `r9700-tunerd.service` (system, enabled, active) |
 | Apply-on-udev unit | `r9700-tunerd-apply.service` |
 | Runtime state | `/run/r9700-tunerd/state`, `/run/r9700-tunerd/ranges.json` |
-| Dashboard server (user unit, transient) | `r9700-ui.service`, started with `systemd-run --user --unit r9700-ui --working-directory=$HOME/src/r9700-tunerd --collect python3 tools/r9700-ui.py` |
+| Dashboard server (user unit, transient) | `r9700-ui.service`, started with `systemd-run --user --unit r9700-ui --working-directory="$HOME/AI Projects/r9700-tunerd" --collect python3 tools/r9700-ui.py` |
 | Dashboard URL | `journalctl --user -u r9700-ui.service \| grep TOKEN` then `http://127.0.0.1:7970/?t=<token>` (token rotates per start) |
 | Native app | `~/.local/bin/r9700-tuner`, menu entry "R9700 Tuner" (installed by `tools/install-app.sh`, no root) |
 | Bench results | `~/r9700-bench/*.json` and `.csv`; `matrix.csv`; `superseded/` for runs the harness later invalidated |
@@ -395,7 +397,7 @@ self-check encodes the distinction.
 
 ```bash
 # unit tests
-cd ~/src/r9700-tunerd && .venv/bin/python -m pytest -q tests/
+cd "$HOME/AI Projects/r9700-tunerd" && .venv/bin/python -m pytest -q tests/
 
 # daemon status (safe while asleep: prints cached ranges instead of waking)
 sudo -n /usr/local/sbin/r9700-tunerd status
@@ -405,10 +407,10 @@ sudo -n /usr/local/sbin/r9700-tunerd set-undervolt -50
 sudo -n /usr/local/sbin/r9700-tunerd set-power-cap 210
 
 # install a new build (never touches the watcher's enable state)
-sudo -n ~/src/r9700-tunerd/install.sh && sudo -n systemctl restart r9700-tunerd.service
+sudo -n "$HOME/AI Projects/r9700-tunerd"/install.sh && sudo -n systemctl restart r9700-tunerd.service
 
 # hardware runner (idle / cycles / storm / config-typo / sigterm / reboot-check)
-sudo -n ~/src/r9700-tunerd/tests/hw/r9700-hwtest.py cycles --cycles 5
+sudo -n "$HOME/AI Projects/r9700-tunerd"/tests/hw/r9700-hwtest.py cycles --cycles 5
 
 # benchmark at the current setting (Ray's LM Studio endpoint)
 python3 tools/r9700-bench.py run --endpoint http://127.0.0.1:1234/v1 \
@@ -420,7 +422,7 @@ python3 tools/r9700-matrix.py --endpoint http://127.0.0.1:1234/v1 \
 python3 tools/r9700-matrix.py --report
 
 # dashboard server as a user unit, then the app
-systemd-run --user --unit r9700-ui --working-directory=$HOME/src/r9700-tunerd --collect python3 tools/r9700-ui.py
+systemd-run --user --unit r9700-ui --working-directory="$HOME/AI Projects/r9700-tunerd" --collect python3 tools/r9700-ui.py
 tools/install-app.sh && r9700-tuner
 ```
 

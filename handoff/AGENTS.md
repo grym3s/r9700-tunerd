@@ -221,9 +221,9 @@ OUT=out.md MAXTOK=16000 python3 handoff/tools/ask_qwen.py B task.md file1.py    
 
 ## Kanban board for the tuner (created 2026-09-04)
 
-Board `r9700-tunerd` (project `r9700-tunerd`, primary repo `~/src/r9700-tunerd`).
-Cards use `--workspace worktree:/home/grymes/src/r9700-tunerd --branch wt/<name>`;
-worktrees appear under `~/src/r9700-tunerd/.worktrees/<task-id>`. The running
+Board `r9700-tunerd` (project `r9700-tunerd`, primary repo `~/AI Projects/r9700-tunerd`).
+Cards use `--workspace "worktree:/home/grymes/AI Projects/r9700-tunerd" --branch wt/<name>`;
+worktrees appear under `~/AI Projects/r9700-tunerd/.worktrees/<task-id>`. The running
 Hermes gateway dispatches cards; `hermes kanban daemon` refuses to run beside
 it. `hermes kanban --board r9700-tunerd list|show <id>` to follow progress.
 **Standing rule from the owner: every agent task goes through a kanban card,
