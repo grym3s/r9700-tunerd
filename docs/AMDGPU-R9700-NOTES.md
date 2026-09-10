@@ -95,6 +95,14 @@ Survives BACO/D3cold.
 - Manual curve floor: `fan_minimum_pwm = 30` (30–100 %).
 - `fan_zero_rpm_enable` exists but writes return `ENOTSUPP` (524). Do not assume a
   custom curve can include a functional zero-RPM region.
+- **This card exposes NO hwmon `pwm1_enable`** — the only manual control path is
+  the OD table (write `"idx temp pct"` × 5 anchors then `"c"`, reset with `"r"`).
+  The daemon's fan controller detects this via `fan_backend()` and commits the
+  user curve quantized onto the five anchors (25/44/62/81/100 C, clamped to the
+  table's own OD_RANGE). Verified on the live card 2026-09-10: engage, no-op
+  re-poll, clean-stop release, and SIGKILL→ExecStopPost release
+  (`r9700-hwtest.py kill9-fan`). Reads can return EBUSY transiently mid-SMU
+  cycle — retry, do not treat as missing.
 - Any future hybrid controller (auto when idle, custom curve under sustained load)
   must be proven not to hold the card out of D3cold.
 

@@ -9,6 +9,7 @@ import argparse
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -467,6 +468,93 @@ def cmd_config_typo(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
+def cmd_kill9_fan(args: argparse.Namespace) -> int:
+    """HAZARD: SIGKILL the daemon while the OD fan curve is engaged, then
+    confirm ExecStopPost (release-hold) hands fan control back to firmware.
+
+    This is the one exit path that skips every in-process handler: only a
+    root kill can trigger it, hence its home here. Restarts the service and
+    leaves the curve config disabled at the end (firmware control)."""
+    cfg = read_conf()
+    pci = discover(cfg)
+    od = pci / "gpu_od" / "fan_ctrl" / "fan_curve"
+
+    def table_nondefault() -> bool | None:
+        try:
+            text = od.read_text()
+        except OSError as e:
+            if e.errno == 16:  # EBUSY mid-SMU-cycle; retry once
+                time.sleep(1.0)
+                try:
+                    text = od.read_text()
+                except OSError:
+                    return None
+            else:
+                return None
+        rows = re.findall(r"^\d+:\s*(-?\d+)C\s+(-?\d+)%$", text, re.M)
+        if not rows:
+            return None
+        return any(int(t) or int(p) for t, p in rows)
+
+    log(f"kill9-fan: curve={args.curve}")
+    subprocess.run(["/usr/local/sbin/r9700-tunerd", "set-fan-curve", args.curve],
+                   check=True, capture_output=True, timeout=15)
+    if not settle(pci):
+        log("  WARNING: GPU did not settle; continuing")
+    fd = open_render(pci)
+    try:
+        if not wait_active(pci, 10):
+            log("  FAIL: GPU did not become active"); return 1
+        # engagement proof = the OD table itself carries committed anchors
+        # (a journal line is nice-to-have, not required: an already-engaged
+        # watcher logs nothing when the anchors did not change)
+        engaged = False
+        nd = None
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 15:
+            nd = table_nondefault()
+            if nd:
+                engaged = True
+                break
+            time.sleep(0.5)
+        log(f"  engaged={engaged} table_nondefault={nd}")
+        if not engaged:
+            log(f"  FAIL: curve did not engage (journal has 'OD curve active': "
+                f"{'OD curve active' in journal_tunerd('-2 min')})")
+            return 1
+        pid = tunerd_pid()
+        if pid is None:
+            log("  FAIL: watcher not running"); return 1
+        os.kill(pid, signal.SIGKILL)
+        log(f"  SIGKILL sent to {pid}")
+        released = False
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 10:
+            if Path(f"/proc/{pid}").exists():
+                time.sleep(0.2)
+                continue
+            nd = table_nondefault()
+            if nd is False:
+                released = True
+                break
+            time.sleep(0.2)
+        log(f"  kill_released={released} table_nondefault_after={nd}")
+        rel_log = [l for l in journal_tunerd("-30 sec").splitlines()
+                   if "fan" in l.lower() and ("release" in l.lower() or "stale" in l.lower())]
+        for l in rel_log:
+            log(f"  journal: {l.strip()}")
+    finally:
+        os.close(fd)
+        subprocess.run(["/usr/local/sbin/r9700-tunerd", "set-fan-curve", "--off"],
+                       check=False, capture_output=True, timeout=15)
+        subprocess.run(["systemctl", "restart", SERVICE],
+                       check=False, capture_output=True, timeout=30)
+    if not released:
+        log("  FAIL: manual control survived SIGKILL"); return 1
+    log("  PASS: SIGKILL release verified, service restarted, curve off")
+    return 0
+
+
 def cmd_sigterm(args: argparse.Namespace) -> int:
     cfg = read_conf()
     pci = discover(cfg)
@@ -605,6 +693,11 @@ def main() -> int:
     p.add_argument("--no-settle", action="store_true",
                    help="skip settle (wait for D3cold) before first wake")
     sub.add_parser("reboot-check", help="full post-reboot acceptance run")
+    p = sub.add_parser(
+        "kill9-fan",
+        help="SIGKILL the daemon mid-fan-curve, verify ExecStopPost releases it",
+    )
+    p.add_argument("--curve", default="34:0,45:30,55:45,65:60,75:75")
     args = ap.parse_args()
     if os.geteuid() != 0:
         print("ERROR: must run as root", file=sys.stderr)
@@ -616,6 +709,7 @@ def main() -> int:
         "config-typo": cmd_config_typo,
         "sigterm": cmd_sigterm,
         "reboot-check": cmd_reboot_check,
+        "kill9-fan": cmd_kill9_fan,
     }[args.cmd](args)
 
 

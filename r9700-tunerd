@@ -72,10 +72,19 @@ class _FanState:
     run as their own process and must never read it (see the docstring on
     _evict_guard_state for the same rule applied to the eviction guard);
     they derive the live fan mode from sysfs instead.
+
+    backend records which control interface engaged manual mode: "pwm"
+    (hwmon pwm1_enable + pwm1, older cards) or "od" (gpu_od/fan_ctrl/
+    fan_curve anchor table — the RX 9700 has no pwm1_enable at all).
+    committed_anchors is the last anchor set successfully committed to the
+    OD table; it is what lets the poll re-commit only on real change and
+    self-heal if the table is wiped (BACO reset, firmware reload).
     """
     mode = "firmware"      # "firmware" or "manual"
+    backend = None         # "pwm", "od", or None (never engaged)
     last_pwm = None        # last written PWM percent (0..100), None if firmware
     peak_temp = None       # highest temp_c since the last hysteresis-gated drop
+    committed_anchors = None  # last OD anchor set committed ("od" backend only)
 
 
 _fan = _FanState()
@@ -579,20 +588,175 @@ def read_fan_pwm_pct(pci: Path) -> float:
     return raw / 255.0 * 100.0
 
 
-def release_fan_to_firmware(pci: Path) -> None:
-    """Best-effort: hand fan control back to firmware (pwm1_enable=2).
+# --- OD backend: gpu_od/fan_ctrl/fan_curve ---------------------------------
+# The RX 9700 (and every RDNA4 card on the current amdgpu driver) exposes NO
+# hwmon pwm1_enable: manual fan control lives only in the overdrive table at
+# <pci>/gpu_od/fan_ctrl/fan_curve. That table has exactly five anchor points
+# (hotspot temperature °C + fan speed %), documented writable ranges
+# FAN_CURVE(hotspot temp) 25..100 C and FAN_CURVE(fan speed) 30..100 %, and a
+# staging protocol: write "index temp pwm" per anchor, then "c" (commit) —
+# or "r" to reset the table to firmware defaults. Reading the table is safe
+# and cheap; all values are clamped into the table's own OD_RANGE.
 
-    Single write, no read-back, never raises. Used on every exit path
-    (clean stop, SIGTERM/SIGINT, unhandled exception, suspend transition,
-    reset) so a crash can never leave manual PWM set. Callers are
-    responsible for only invoking this while the card is active (writing
-    hwmon while suspended is exactly what the hard rules forbid); this
-    function itself does not check runtime_status so it stays a pure
-    single-write primitive that is safe to call from a `finally` block.
+
+def od_fan_curve_file(pci: Path) -> Path:
+    return pci / "gpu_od" / "fan_ctrl" / "fan_curve"
+
+
+def parse_od_fan_curve(text: str) -> tuple[list[tuple[int, int]] | None, dict | None]:
+    """Parse a gpu_od/fan_ctrl/fan_curve read-back.
+
+    Returns (points, range) where points is five (temp_c, pwm_pct) anchor
+    tuples in index order and range is {"t_min","t_max","p_min","p_max"}
+    from the OD_RANGE block. (None, None) if the text is not a fan_curve
+    table (no OD_FAN_CURVE header or no anchor lines).
     """
+    points: list[tuple[int, int]] = []
+    t_min = t_max = p_min = p_max = None
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("OD_FAN_CURVE:"):
+            continue
+        if s.startswith("FAN_CURVE(hotspot temp):"):
+            nums = re.findall(r"(-?\d+)C", s)
+            if len(nums) == 2:
+                t_min, t_max = float(nums[0]), float(nums[1])
+            continue
+        if s.startswith("FAN_CURVE(fan speed):"):
+            nums = re.findall(r"(-?\d+)%", s)
+            if len(nums) == 2:
+                p_min, p_max = float(nums[0]), float(nums[1])
+            continue
+        m = re.match(r"^(\d+):\s*(-?\d+)C\s+(-?\d+)%$", s)
+        if m:
+            points.append((int(m.group(2)), int(m.group(3))))
+    if not points:
+        return None, None
+    rng = None
+    if None not in (t_min, t_max, p_min, p_max):
+        rng = {"t_min": t_min, "t_max": t_max, "p_min": p_min, "p_max": p_max}
+    return points, rng
+
+
+def read_od_fan_curve(pci: Path) -> tuple[list[tuple[int, int]] | None, dict | None]:
+    return parse_od_fan_curve(read_text(od_fan_curve_file(pci)))
+
+
+# The driver's anchor temps are the five evenly spaced points over the
+# default documented range (25, 43.75, 62.5, 81.25, 100); integer-rounded to
+# the values LACT and the in-kernel parser round-trip.
+OD_ANCHOR_TEMPS_DEFAULT = (25, 44, 62, 81, 100)
+
+
+def od_anchor_points(
+    curve: list[tuple[float, float]],
+    rng: dict | None = None,
+) -> list[tuple[int, int]]:
+    """Quantize a user curve (temp:pwm points) into the OD table's five
+    anchors: evenly spaced temps across the table's range, each anchor's
+    speed interpolated from the user curve and clamped into the table's
+    pwm range. Monotone non-decreasing is enforced by construction (curve
+    is validated monotonic; clamping preserves it).
+    """
+    if rng is None:
+        t_lo, t_hi = 25.0, 100.0
+        p_lo, p_hi = 30.0, 100.0
+    else:
+        t_lo, t_hi = float(rng["t_min"]), float(rng["t_max"])
+        p_lo, p_hi = float(rng["p_min"]), float(rng["p_max"])
+    span = t_hi - t_lo
+    anchors: list[tuple[int, int]] = []
+    for i in range(5):
+        t = t_lo + span * i / 4.0
+        pwm = fan_curve_interpolate(curve, t)
+        pwm = max(p_lo, min(p_hi, pwm))
+        # round pwm up to int, but keep temps on their evenly spaced grid,
+        # nudged to strictly increasing integers when the range is narrow.
+        anchors.append((int(round(t)), int(round(pwm))))
+    # enforce strictly increasing temps (driver rejects ties)
+    for i in range(1, 5):
+        if anchors[i][0] <= anchors[i - 1][0]:
+            anchors[i] = (anchors[i - 1][0] + 1, anchors[i][1])
+    # a nudge could push the last temp over t_hi; clamp from the top down
+    if anchors[4][0] > int(round(t_hi)) and int(round(t_hi)) - int(round(t_lo)) >= 4:
+        anchors[4] = (int(round(t_hi)), anchors[4][1])
+        for i in (3, 2, 1):
+            if anchors[i][0] >= anchors[i + 1][0]:
+                anchors[i] = (anchors[i + 1][0] - 1, anchors[i][1])
+    return anchors
+
+
+def write_od_fan_curve(pci: Path, anchors: list[tuple[int, int]]) -> None:
+    """Stage all five anchors then commit. Raises on any failed write."""
+    f = od_fan_curve_file(pci)
+    for i, (t, p) in enumerate(anchors):
+        write_text(f, f"{i} {t} {p}\n")
+    write_text(f, "c\n")
+
+
+def reset_od_fan_curve(pci: Path) -> None:
+    """Best-effort "r": restore the firmware-default curve. Never raises
+    (exit-path primitive, same contract as release_fan_to_firmware)."""
     try:
-        write_fan_mode(pci, 2)
-        log("fan control released to firmware (pwm1_enable=2)")
+        write_text(od_fan_curve_file(pci), "r\n")
+    except Exception:
+        pass
+
+
+def fan_backend(pci: Path) -> str:
+    """Which manual fan-control interface this card offers.
+
+    "od"    — gpu_od/fan_ctrl/fan_curve with a parseable table (RDNA4:
+              the preferred path; pwm1_enable does not exist there).
+    "pwm"   — hwmon pwm1_enable (older cards).
+    "none"  — neither; firmware control is the only option.
+
+    OD is preferred when both exist because on cards that expose both,
+    writing pwm1_enable=1 while the OD table drives the fan is a known
+    source of fighting controllers, and OD is the interface the firmware
+    curve itself is expressed in.
+    """
+    od_file = od_fan_curve_file(pci)
+    od_ok = False
+    if od_file.is_file():
+        try:
+            _, rng = parse_od_fan_curve(read_text(od_file))
+            od_ok = rng is not None
+        except Exception:
+            od_ok = False
+    h = hwmon_dir(pci)
+    pwm_ok = h is not None and (h / "pwm1_enable").is_file()
+    if od_ok:
+        return "od"
+    if pwm_ok:
+        return "pwm"
+    return "none"
+
+
+def release_fan_to_firmware(pci: Path) -> None:
+    """Best-effort: hand fan control back to firmware. Never raises.
+
+    Backend-aware: pwm backend writes pwm1_enable=2, OD backend writes "r"
+    to reset the overdrive curve table. Used on every exit path (clean
+    stop, SIGTERM/SIGINT, unhandled exception, suspend transition, reset)
+    so a crash can never leave manual control set. Callers are responsible
+    for only invoking this while the card is active (writing hwmon/OD while
+    suspended is exactly what the hard rules forbid); this function itself
+    does not check runtime_status so it stays a pure single-write primitive
+    that is safe to call from a `finally` block.
+    """
+    backend = _fan.backend if _fan.backend in ("pwm", "od") else fan_backend(pci)
+    if backend == "none":
+        # Neither interface exists: there is nothing to release (and any
+        # write attempt would only create a bogus file or spam errors).
+        return
+    try:
+        if backend == "od":
+            reset_od_fan_curve(pci)
+            log("fan control released to firmware (OD table reset)")
+        else:
+            write_fan_mode(pci, 2)
+            log("fan control released to firmware (pwm1_enable=2)")
     except Exception as e:
         log(f"fan curve: firmware release failed: {e}", syslog.LOG_ERR)
 
@@ -619,8 +783,10 @@ def fan_controller_poll(pci: Path, conf: dict) -> None:
         if _fan.mode == "manual":
             release_fan_to_firmware(pci)
             _fan.mode = "firmware"
+            _fan.backend = None
             _fan.last_pwm = None
             _fan.peak_temp = None
+            _fan.committed_anchors = None
         return
 
     hysteresis = conf.get("FAN_HYSTERESIS_C", 3.0)
@@ -630,9 +796,45 @@ def fan_controller_poll(pci: Path, conf: dict) -> None:
         log(f"fan curve: temp read failed: {e}", syslog.LOG_WARNING)
         return
 
+    if _fan.mode != "manual":
+        backend = fan_backend(pci)
+        if backend == "none":
+            # Nothing to engage (e.g. RDNA4 card whose OD table disappeared
+            # after a rebind). Stay on firmware without touching sysfs; the
+            # startup orphan check and the next successful read cover it.
+            if not getattr(fan_controller_poll, "_warned_none", False):
+                log(
+                    "fan curve: no manual control interface (no pwm1_enable, "
+                    "no gpu_od fan table); staying on firmware control",
+                    syslog.LOG_WARNING,
+                )
+                fan_controller_poll._warned_none = True
+            return
+        _fan.backend = backend
+
     target, peak = fan_target_pwm(curve, temp_c, hysteresis, _fan.last_pwm, _fan.peak_temp)
     _fan.peak_temp = peak
 
+    if _fan.backend == "od":
+        try:
+            _, rng = read_od_fan_curve(pci)
+            anchors = od_anchor_points(curve, rng)
+            if anchors != _fan.committed_anchors:
+                write_od_fan_curve(pci, anchors)
+                _fan.committed_anchors = anchors
+                log(
+                    "fan curve: OD curve active "
+                    f"(anchors={'/'.join(f'{t}:{p}%' for t, p in anchors)}, "
+                    f"temp={temp_c:.0f}C)"
+                )
+            _fan.mode = "manual"
+            _fan.last_pwm = target
+        except Exception as e:
+            log(f"fan curve: OD update failed: {e}", syslog.LOG_ERR)
+            return
+        return
+
+    # pwm backend (cards with hwmon pwm1_enable)
     if _fan.mode != "manual":
         try:
             write_fan_mode(pci, 1)
@@ -657,8 +859,10 @@ def fan_release_if_manual(pci: Path | None) -> None:
     if _fan.mode == "manual" and pci is not None:
         release_fan_to_firmware(pci)
     _fan.mode = "firmware"
+    _fan.backend = None
     _fan.last_pwm = None
     _fan.peak_temp = None
+    _fan.committed_anchors = None
 
 
 # ---------------------------------------------------------------------------
@@ -1537,10 +1741,14 @@ def _evict_guard_state(conf: dict, pci=None) -> dict:
 def _fan_status(conf: dict, pci: Path, st: str) -> dict:
     """PM-safe snapshot of the fan-curve config/mode for status/status --json.
 
-    Never reads pwm1_enable/pwm1/fan1_input while not active (the hard
-    rule: no hwmon reads while suspended). `status`/`doctor` run as their
-    own process, so — like _evict_guard_state — this can only report what
-    is on disk (the validated config) plus what is safe to read live.
+    Never reads pwm1_enable/pwm1/fan1_input or gpu_od while not active (the
+    hard rule: no hwmon/OD reads while suspended). `status`/`doctor` run as
+    their own process, so — like _evict_guard_state — this can only report
+    what is on disk (the validated config) plus what is safe to read live.
+
+    mode is "od" when the gpu_od fan_curve table carries a non-default
+    (someone-committed) curve, "manual"/"firmware" from pwm1_enable on pwm
+    cards, None when the interface is unreadable.
     """
     enabled = bool(conf.get("FAN_CURVE_ENABLED"))
     curve = conf.get("FAN_CURVE")
@@ -1550,17 +1758,30 @@ def _fan_status(conf: dict, pci: Path, st: str) -> dict:
         "curve": curve_str,
         "hysteresis_c": conf.get("FAN_HYSTERESIS_C"),
         "mode": None,
+        "od_curve": None,
         "pwm_pct": None,
         "rpm": None,
     }
     if st != "active":
         return out
+    backend = fan_backend(pci)
+    if backend == "od":
+        try:
+            points, _rng = read_od_fan_curve(pci)
+            if points is not None:
+                out["od_curve"] = points
+                out["mode"] = "firmware" if not any(t or p for t, p in points) else "od"
+        except Exception:
+            out["mode"] = None
+    else:
+        try:
+            mode_val = read_fan_mode(pci)
+            out["mode"] = "manual" if mode_val == 1 else "firmware"
+        except Exception:
+            out["mode"] = None
     try:
-        mode_val = read_fan_mode(pci)
-        out["mode"] = "manual" if mode_val == 1 else "firmware"
-    except Exception:
-        out["mode"] = None
-    try:
+        # pwm1 exists on both backends (on OD cards it mirrors the current
+        # duty the table produces); the read is read-only either way.
         out["pwm_pct"] = round(read_fan_pwm_pct(pci), 1)
     except Exception:
         pass
@@ -2225,21 +2446,34 @@ def cmd_watch(conf: dict) -> int:
 
     # --- Fan curve: startup orphan check ---------------------------------
     # A previous instance may have crashed (or been SIGKILLed) while
-    # holding pwm1_enable=1 with nobody left to release it. This process
-    # has no live controller state yet (module import defaults to
-    # "firmware"), so if we find pwm1_enable=1 while active, that PWM
-    # value has no owner: release it now rather than adopt it (fan
-    # control, unlike the eviction guard, only fails safe by returning
-    # to firmware; there is no "hold" worth preserving across restarts).
+    # holding manual fan control with nobody left to release it. This
+    # process has no live controller state yet (module import defaults to
+    # "firmware"), so if we find the card under manual control at startup,
+    # that control has no owner: release it now rather than adopt it (fan
+    # control, unlike the eviction guard, only fails safe by returning to
+    # firmware; there is no "hold" worth preserving across restarts).
+    # Backend-aware: pwm cards expose pwm1_enable=1; OD cards expose a
+    # non-stock gpu_od fan_curve table (any non-zero anchor means someone
+    # committed a custom curve).
     if pci is not None and is_active(pci):
         try:
-            if read_fan_mode(pci) == 1:
+            backend = fan_backend(pci)
+            if backend == "pwm" and read_fan_mode(pci) == 1:
                 log(
                     "fan curve: found pwm1_enable=1 with no live controller at "
                     "startup; releasing to firmware",
                     syslog.LOG_WARNING,
                 )
                 release_fan_to_firmware(pci)
+            elif backend == "od":
+                points, _rng = read_od_fan_curve(pci)
+                if points is not None and any(t or p for t, p in points):
+                    log(
+                        "fan curve: found non-default OD fan table with no live "
+                        "controller at startup; resetting to firmware defaults",
+                        syslog.LOG_WARNING,
+                    )
+                    release_fan_to_firmware(pci)
         except Exception as e:
             log(f"fan curve: startup orphan check failed: {e}", syslog.LOG_WARNING)
 
@@ -2517,14 +2751,21 @@ def cmd_release_hold(conf: dict) -> int:
             "evict-guard: no hold to release "
             f"(control={current}, state={state_data.get('state', 'unknown')})"
         )
-    # Fan curve: release manual PWM if the card is active.
+    # Fan curve: release manual control if the card is active.
     # Same contract as the eviction guard release: best-effort,
     # never raises, only writes when there is something to release.
     if is_active(pci):
         try:
-            if read_fan_mode(pci) == 1:
+            backend = fan_backend(pci)
+            stale = False
+            if backend == "pwm":
+                stale = read_fan_mode(pci) == 1
+            elif backend == "od":
+                points, _ = read_od_fan_curve(pci)
+                stale = points is not None and any(t or p for t, p in points)
+            if stale:
                 release_fan_to_firmware(pci)
-                log("fan curve: released stale manual PWM (ExecStopPost)")
+                log("fan curve: released stale manual control (ExecStopPost)")
         except Exception as e:
             log(f"fan curve: ExecStopPost release failed: {e}", syslog.LOG_WARNING)
     return 0
