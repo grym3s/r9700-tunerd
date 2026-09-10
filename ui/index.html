@@ -475,6 +475,56 @@ pre.log{margin:0;font-family:var(--mono);font-size:12px;color:#b9c4cf;background
     } catch(e){}
   };
   $('fanOffBtn').onclick = () => { if (confirm('Disable the fan curve and hand control back to firmware?')) post('/api/set-fan-curve', {off:true}, 'Fan → firmware'); };
+
+  // ---- fan curve drag interaction ----
+  // Points on the canvas are draggable (pointer events; touch works too).
+  // Coordinate maps must match fanRenderCanvas's xOf/yOf exactly.
+  let fanDrag = null;
+  function fanCanvasXY(e){
+    const r = fanCanvas.getBoundingClientRect();
+    return [(e.clientX-r.left) * fanCanvas.width / r.width,
+            (e.clientY-r.top)  * fanCanvas.height / r.height];
+  }
+  function fanHit(x, y){
+    const dpr = window.devicePixelRatio||1, W = fanCanvas.width, H = fanCanvas.height;
+    const xOf = t => (t/110)*W, yOf = p => H - (p/100)*H*0.9 - 6*dpr;
+    let best = null, bestD = Infinity;
+    for (const p of fanPoints){
+      if (!Number.isFinite(p[0]) || !Number.isFinite(p[1])) continue;
+      const dx = xOf(p[0])-x, dy = yOf(p[1])-y, d = dx*dx+dy*dy;
+      if (d < bestD){ bestD = d; best = p; }
+    }
+    return (best && bestD <= Math.pow(14*dpr, 2)) ? best : null;
+  }
+  fanCanvas.style.touchAction = 'none';
+  fanCanvas.addEventListener('pointerdown', e => {
+    const [x,y] = fanCanvasXY(e);
+    const p = fanHit(x, y);
+    if (!p) return;
+    fanDrag = p; fanEditing = true;
+    fanCanvas.setPointerCapture(e.pointerId);
+    fanCanvas.style.cursor = 'grabbing';
+    e.preventDefault();
+  });
+  fanCanvas.addEventListener('pointermove', e => {
+    const dpr = window.devicePixelRatio||1, W = fanCanvas.width, H = fanCanvas.height;
+    const [x,y] = fanCanvasXY(e);
+    if (!fanDrag){ fanCanvas.style.cursor = fanHit(x, y) ? 'grab' : 'default'; return; }
+    const t = Math.round(Math.min(110, Math.max(0, (x/W)*110)));
+    const pwm = Math.round(Math.min(100, Math.max(0, (H - y - 6*dpr)/(H*0.9)*100)));
+    if (t === fanDrag[0] && pwm === fanDrag[1]) return;
+    fanDrag[0] = t; fanDrag[1] = pwm;
+    fanRenderTable(); fanRenderCanvas();
+    $('fanErr').textContent = fanValidate(fanPoints) || '';
+  });
+  const fanEndDrag = e => {
+    if (!fanDrag) return;
+    fanDrag = null;
+    try { fanCanvas.releasePointerCapture(e.pointerId); } catch(_){}
+    fanCanvas.style.cursor = 'default';
+  };
+  fanCanvas.addEventListener('pointerup', fanEndDrag);
+  fanCanvas.addEventListener('pointercancel', fanEndDrag);
   fanRenderCanvas();
 
   // ---- matrix results (read-only) ----

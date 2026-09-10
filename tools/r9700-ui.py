@@ -27,6 +27,10 @@ CONF_PATH = Path("/etc/r9700-tunerd.conf")
 RANGES_CACHE = Path("/run/r9700-tunerd/ranges.json")
 STATE_FILE = Path("/run/r9700-tunerd/state")
 BENCH_DIR = Path("~/r9700-bench").expanduser()
+# Historical bench runs lived beside the repo before ~/r9700-bench was the
+# convention (the repo itself moved in Sept 2026); scan both so the
+# MEASURED profile tags see the real results instead of showing PLACEHOLDER.
+BENCH_DIR_FALLBACKS = [Path("~/Projects/r9700-bench").expanduser()]
 BENCH_SCRIPT = Path(__file__).resolve().parent / "r9700-bench.py"
 REPO_ROOT = Path(__file__).resolve().parent.parent
 UI_HTML = REPO_ROOT / "ui" / "index.html"
@@ -632,9 +636,19 @@ def _bench_stable(r, agg, errors):
 
 def _list_bench():
     results = []
-    if not BENCH_DIR.is_dir():
+    if not BENCH_DIR.is_dir() and not any(d.is_dir() for d in BENCH_DIR_FALLBACKS):
         return results
-    for f in sorted(BENCH_DIR.glob("*.json")):
+    seen: set[str] = set()
+    files: list[Path] = []
+    for d in [BENCH_DIR, *BENCH_DIR_FALLBACKS]:
+        if not d.is_dir():
+            continue
+        for f in sorted(d.glob("*.json")):
+            if "superseded" in f.parts or f.name in seen:
+                continue
+            seen.add(f.name)
+            files.append(f)
+    for f in sorted(files, key=lambda p: p.name):
         if "superseded" in f.parts:
             continue
         try:

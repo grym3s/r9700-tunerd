@@ -114,6 +114,7 @@ def fake_ui_tree(tmp_path, monkeypatch):
     monkeypatch.setattr(ui_mod, "RANGES_CACHE", ranges_path)
     monkeypatch.setattr(ui_mod, "STATE_FILE", state_path)
     monkeypatch.setattr(ui_mod, "BENCH_DIR", bench_dir)
+    monkeypatch.setattr(ui_mod, "BENCH_DIR_FALLBACKS", [tmp_path / "bench-fallback"])
     monkeypatch.setattr(ui_mod, "UI_HTML", ui_html)
     monkeypatch.setattr(ui_mod, "BENCH_SCRIPT", tmp_path / "r9700-bench.py")
     monkeypatch.setattr(ui_mod, "DAEMON_CLI", "/usr/local/sbin/r9700-tunerd")
