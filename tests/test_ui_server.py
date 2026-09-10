@@ -295,6 +295,21 @@ class TestStatusPayload:
         assert body["live"] is None
         assert body["sampling"]["mode"] == "asleep"
 
+    def test_missing_pwm1_enable_does_not_break_status(self, server, fake_ui_tree):
+        """Regression: the R9700 has no pwm1_enable (fan control lives in
+        gpu_od/fan_ctrl/). A FileNotFoundError from that optional sensor
+        must degrade to fan_mode=null, not 500 the entire /api/status
+        request — that is what blanked the GUI with 'API load failed'."""
+        hwmon = fake_ui_tree / "pci" / "0000:aa:00.0" / "hwmon" / "hwmon7"
+        (hwmon / "pwm1_enable").unlink()  # match the real card
+
+        ui_mod._SAMPLING = ui_mod._SamplingState()
+        code, body = _get(server, "/api/status", token="test-token-abcdef")
+        assert code == 200
+        assert body["live"] is not None  # sensors still read
+        assert body["live"]["fan_mode"] is None
+        assert body["live"]["fan_pwm_pct"] == 50.2  # pwm1=128 still parsed
+
 
 # ---------------------------------------------------------------------------
 # Adaptive sampling (unit-level, no HTTP)
